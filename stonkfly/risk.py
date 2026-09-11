@@ -49,14 +49,14 @@ class Guard:
         if side == "BUY":
             limit = up(q.ask * (1 + D(self.s.slippage)), q.price_increment)
             budget = min(D(self.s.order_limit), self.l.cash) / (1 + reserve)
-            size = down(budget / limit, q.base_increment)
+            size = down(budget / limit, q.lot_size)
         else:
             limit = down(q.bid * (1 - D(self.s.slippage)), q.price_increment)
             size = down(
                 min(self.l.positions.get(product, D(0)), D(self.s.order_limit) / q.ask),
-                q.base_increment,
+                q.lot_size,
             )
-        if limit <= 0 or size < q.minimum_base or size * limit < q.minimum_quote:
+        if limit <= 0 or size < q.lot_size or size * limit < q.minimum_quote:
             raise Veto("Insufficient funds/position or below exchange minimum")
         return {
             "product": product,
@@ -68,7 +68,12 @@ class Guard:
             "observed_ask": str(q.ask),
             "quote_timestamp": q.timestamp,
             "settings": self.s.signature(),
-            "order_type": "limit_limit_fok",
+            # PPI documents no immediate-or-cancel/FOK term; a day limit order
+            # is submitted and force-cancelled at a bounded deadline instead
+            # (see PPIBroker.execute) to keep the same fill-or-kill-like
+            # bounded-risk guarantee the Guard's cooldown model assumes.
+            "operation_type": "PRECIO-LIMITE",
+            "operation_term": "POR-EL-DÍA",
         }
 
     def before_submit(self, plan):

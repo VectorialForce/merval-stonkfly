@@ -1,6 +1,6 @@
 # Running and stopping Stonkfly
 
-Use a dedicated account portfolio. Stonkfly is an experiment capable of losing its entire allocated balance. The funding cap is **100 USDC at initialization**, not an assertion that USDC always equals one dollar.
+Use a dedicated PPI account. Stonkfly is an experiment capable of losing its entire allocated balance. The funding cap is **ARS 100,000 at initialization**, an arbitrary starting point for the experiment, not a claim about what that buys or how it holds value over time.
 
 ## Installation and data
 
@@ -11,36 +11,47 @@ Existing DOOMFLY researchers can reuse verified local files with `python -m ston
 ## Paper modes
 
 ```sh
-# Real public prices; simulated fills and 0.6% fee per side.
-python -m stonkfly run --steps 10
-
-# Explicit synthetic offline market, accelerated development run.
+# Synthetic offline market, no credentials needed.
 python -m stonkfly run --fixture --fast --steps 10 --out runs/fixture
+
+# Real PPI quotes; simulated fills only, never places an order. Requires .env.
+python -m stonkfly run --real-data --steps 10
 
 # Frozen-memory control, always in a separate run directory.
 python -m stonkfly run --fixture --fast --frozen --steps 10 --out runs/frozen
 ```
 
-`--fast` skips wall waits only in paper mode. It preserves the 0.1 ms neural timestep and the real 60-second execution cooldown, so an accelerated probe can have many rejected trades. This is a plumbing/neural test, not a backtest of achievable market returns. Paper fills use observed bid/ask plus the configured fee; they do not simulate depth, queue position or all market impact. `--fixture` never claims real market data.
+`--fast` skips wall waits only in paper mode. It preserves the 0.1 ms neural timestep and the real 60-second execution cooldown, so an accelerated probe can have many rejected trades. This is a plumbing/neural test, not a backtest of achievable market returns. Paper fills use observed bid/ask plus the configured fee; they do not simulate depth, queue position or all market impact. `--fixture` never claims real market data. Plain `run` with no flags behaves like `--fixture`: PPI requires authenticated headers on every endpoint, including market data, so there is no unauthenticated "real prices, no key" default the way Coinbase's public order book allowed.
 
-## Coinbase setup, performed by you
+## PPI setup, performed by you
 
-1. Create a separate Coinbase Advanced portfolio and put up to 100 USDC in it. Start without other assets or open orders. Do not mix other bots, manual trades or deposits into that portfolio while Stonkfly runs.
-2. Create a [Coinbase App API key](https://docs.cdp.coinbase.com/coinbase-app/authentication-authorization/api-key-authentication) with ECDSA, **View and Trade**, **Transfer disabled**, scoped only to that portfolio. The program checks permissions and portfolio scope; an account-wide key is rejected.
-3. Save the downloaded key JSON locally as `coinbase-key.json` and restrict its file permissions (`chmod 600 coinbase-key.json`). It typically contains `name` and `privateKey`. Never paste the key into a commit or README.
-4. Copy `.env.example` to `.env`, set the key path and `COINBASE_PORTFOLIO_ID`, then set `STONKFLY_LIVE=I_ACCEPT_REAL_TRADES`. The CLI also requires `--live`; paper mode never submits an order even if the environment variable is present.
-5. Run `python -m stonkfly run --live --preflight-only`. This reads permissions, account balances and order state, and initializes the local ledger. **It does not submit orders.** Once you have reviewed the configuration, run `python -m stonkfly run --live` yourself.
+1. Get PPI API credentials (sandbox or production): `AuthorizedClient`, `ClientKey`, `ApiKey`, `ApiSecret`, your account number, and the base server URL — PPI's docs don't publish a fixed hostname, so get it from your dashboard/sandbox invitation alongside the credentials.
+2. Copy `.env.example` to `.env` and fill in `PPI_BASE_URL`, `PPI_AUTHORIZED_CLIENT`, `PPI_CLIENT_KEY`, `PPI_API_KEY`, `PPI_API_SECRET`. This alone is enough for `--real-data` paper mode.
+3. For `--live`, additionally set `PPI_ACCOUNT_NUMBER` and `STONKFLY_LIVE=I_ACCEPT_REAL_TRADES`. The CLI also requires `--live`; paper mode never submits an order even if the environment variable is present.
+4. Run `python -m stonkfly run --live --preflight-only`. This reads balances/positions and open orders, and initializes the local ledger. **It does not submit orders.** Once you have reviewed the configuration, run `python -m stonkfly run --live` yourself.
 
-The key must be allowed to trade the requested pairs in your region. Defaults use BTC-USDC; ETH-USDC and SOL-USDC are optional via `--products`. Only available spot products pass checks. Coinbase preview warnings, unsupported order types or insufficient fee coverage stop the order; there is no fallback to an unbounded market order.
+Defaults trade `GGAL`; `YPF`, `PAMP`, `AAPL` and `KO` (CEDEARs and acciones líderes) are optional via `--products`. Only this closed allowlist is accepted.
+
+### Known gaps before ever using `--live`
+
+PPI's public API docs are considerably thinner than Coinbase's on exactly the details this program depends on for correctness. Concretely, unverified against a real sandbox account:
+
+- **No documented order status enum.** A terminal order is inferred from its absence in `Order/ActiveOrders`, not from a status string.
+- **No documented fill-vs-requested-quantity split.** `Order/Detail`'s `quantity`/`amount` fields are assumed to reflect the actual fill; a genuine partial fill cannot currently be distinguished from a full fill.
+- **No documented commission field.** Fills are booked with zero fee. A real PPI account will charge a commission this ledger will not see, and `verify_balances()` is expected to trip on the resulting mismatch — that is the intended fail-safe, not a bug, but it means `--live` is not yet usable end-to-end.
+- **No documented immediate-or-cancel/FOK order term.** A day limit order (`POR-EL-DÍA`) is submitted and force-cancelled at a 30-second deadline if still resting, to keep the same bounded-risk shape the cooldown/veto model assumes.
+- **`BalancesAndPositions`' schema is inferred**, not documented, to mix cash and security holdings into one array by `simbol`.
+
+Do not use `--live` until these are checked against real sandbox responses, ideally cross-referenced with `Account/Movements`.
 
 ## Execution guarantees and limits
 
-- Maximum initial funding: 100 USDC. Maximum buy commitment: 10 USDC including a 2% fee reserve. Sell quantity is capped by owned inventory and 10 USDC observed notional; a better execution price can yield slightly more proceeds. No borrowing, shorting, transfers or leverage actions are exposed.
+- Maximum initial funding: ARS 100,000. Maximum buy commitment: ARS 10,000 including a 2% fee reserve. Sell quantity is capped by owned inventory and ARS 10,000 observed notional; a better execution price can yield slightly more proceeds. No borrowing, shorting, transfers or leverage actions are exposed. Instruments trade in whole shares only.
 - At most 24 order attempts per UTC day and at least 60 seconds between attempts. Rejected previews count. Failed orders do not become new strategy choices.
-- Price-bounded fill-or-kill orders use at most 0.5% slippage and 0.5% spread. Quotes must be no older than 15 seconds. A fresh book is fetched after neural integration; a move beyond the observation tolerance vetoes the trade. Preview fees, account balances and the STOP condition are checked before submission.
-- At 20 USDC drawdown from starting equity, **stop new orders**. This is not a liquidation order or guaranteed maximum loss. Existing holdings remain exposed; price moves between observations can exceed the threshold. Decide separately how you want to manage those holdings.
-- SQLite records a unique client order ID before submission. An uncertain response stays unresolved; the worker searches the exchange for that same ID instead of sending a new order. Missing/ambiguous results stop the worker for manual review. Final fills and fees settle exactly once. Unexpected actual fees are booked, then further orders halt.
-- The local process lock prevents two workers using one run directory. It does not coordinate multiple computers or copied ledgers. Run one worker for the dedicated portfolio, and do not delete the live ledger to bypass checks.
+- Price-bounded day limit orders use at most 0.5% slippage and 0.5% spread. Quotes must be no older than 15 seconds — outside BYMA session hours this staleness check is what naturally stops new trades (PPI's docs don't publish session hours, so there is no separate "market closed" schedule; a stale quote is treated the same whether the cause is an overnight gap or a genuine feed problem). A fresh book is fetched after neural integration; a move beyond the observation tolerance vetoes the trade. `Order/Budget` and account balances are checked before submission.
+- At ARS 20,000 drawdown from starting equity, **stop new orders**. This is not a liquidation order or guaranteed maximum loss. Existing holdings remain exposed; price moves between observations can exceed the threshold. Decide separately how you want to manage those holdings.
+- SQLite records a unique client order ID (sent to PPI as `externalID`) before submission. An uncertain response stays unresolved; the worker searches PPI for that same `externalID` instead of sending a new order. Missing/ambiguous results stop the worker for manual review. Final fills settle exactly once. Unexpected actual fees are booked, then further orders halt.
+- The local process lock prevents two workers using one run directory. It does not coordinate multiple computers or copied ledgers. Run one worker for the dedicated account, and do not delete the live ledger to bypass checks.
 
 ## State, recovery and privacy
 
@@ -48,8 +59,8 @@ The worker must stay running on your computer/server. It is not a hosted service
 
 `runs/<name>/` holds a SQLite ledger, two alternating checkpoints, `events.jsonl`, `latest.json`, `latest-input.png`, and provenance with exact code, graph, stimulus and parameter hashes. Each intent binds to the preceding neural observation and checkpoint. The ledger is authoritative if a crash occurs before the human-readable log is written.
 
-To stop: Ctrl-C, or `touch runs/live/STOP` (`runs/paper/STOP` for paper). This stops future decisions/submissions; an already submitted FOK order may still finish. Inspect any uncertain order in Coinbase before taking another action.
+To stop: Ctrl-C, or `touch runs/live/STOP` (`runs/paper/STOP` for paper). This stops future decisions/submissions; an already submitted order may still finish or still be resting. Inspect any uncertain order in PPI before taking another action.
 
 For an ordinary clean restart, use the same command and run directory. After reviewing a transient failure and reconciling account state, remove the STOP file if appropriate and pass `--resume-reviewed`. This cannot clear a drawdown or fee-overrun stop, bypass unresolved exchange outcomes, or accept changed source/configuration. A missing unknown order requires manual exchange investigation; do not assume it failed. Source changes require an explicitly reviewed state migration; use a fresh **paper** directory for development.
 
-All runtime state, balances, account IDs, data, `.env` and the default key filenames are git-ignored. Keep custom key paths outside the repository. Tests use doubles and never submit real orders. No live account credentials or real balances are bundled.
+All runtime state, balances, account IDs, data, `.env` and the default key filenames are git-ignored. Keep custom credentials outside the repository. Tests use doubles and never submit real orders. No live account credentials or real balances are bundled.

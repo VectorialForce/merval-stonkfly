@@ -16,7 +16,7 @@ The event-driven kernel avoids unnecessary subthreshold updates; it does not pru
 
 ## What the fly sees
 
-Coinbase public completed one-minute candle closes initialize the price history. Subsequent observation midpoints are appended. A fixed 320×180 chart shows past prices, pair name and current bid/ask; the simulator receives its **RGB pixels**, not raw prices or indicators. The chart is locally rendered, not a capture of a logged-in Coinbase account. It excludes portfolio balances and P&L.
+PPI historical bars (`MarketData/Search`) initialize the price history. Subsequent observation midpoints are appended. A fixed 320×180 chart shows past prices, ticker name and current bid/ask; the simulator receives its **RGB pixels**, not raw prices or indicators. The chart is locally rendered, not a capture of a logged-in PPI account. It excludes portfolio balances and P&L.
 
 3,335 mapped R1–R6 cells receive linear-sRGB luminance; 811 mapped R8 cells receive blue/green proxies. Sample locations are inferred from contacts with column-annotated visual cells, using overlapping left/right viewports. Unmapped receptors get no invented optical input. Photoreceptors and lamina are graded in real flies; using spikes, RGB channels, saturating current and a 12 mV-equivalent lamina bias is an explicit display adapter, not validated retinal physiology.
 
@@ -36,11 +36,11 @@ Over each observation, mean right DNp20 firing minus mean left DNp20 firing is d
 
 This is an engineered interface, not a discovery of “buy neurons.” The mapping is fixed and reads only spike counts. Selected cell IDs appear in the local audit log. Persistent turning-like network bias can therefore become persistent buying; do not interpret that as market insight.
 
-The guard can reject a proposal for price, budget, inventory, timing or account-state reasons. It cannot replace the proposal or manufacture a profitable policy. AgentKit supplies the ActionProvider/Action interface; our custom provider bridges the separate [Coinbase Advanced exchange API](https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/rest-api). Built-in AgentKit on-chain wallet swaps are not used.
+The guard can reject a proposal for price, budget, inventory, timing or account-state reasons. It cannot replace the proposal or manufacture a profitable policy. A small local client bridges the separate [PPI REST API](https://itatppi.github.io/ppi-official-api-docs/api/documentacionRest/); there is no general-purpose trading/wallet framework in between.
 
 ## What changes with profit and loss
 
-At the next observation, equity is cash plus holdings marked at the current bid. Its change since the last observation includes booked fees and unrealized price changes. A change of at least +0.01 USDC schedules a **200 ms, 20 mV-equivalent** artificial current into all **15 PAM11 (α1)** cells. A change of at most −0.01 USDC schedules the same pulse into the **two PPL101 (γ1pedc)** cells. The pulse is binary above the threshold, not proportional to profit. The deadband is per observation; tiny changes are not accumulated into a later pulse.
+At the next observation, equity is cash plus holdings marked at the current bid. Its change since the last observation includes booked fees and unrealized price changes. A change of at least +10 ARS schedules a **200 ms, 20 mV-equivalent** artificial current into all **15 PAM11 (α1)** cells. A change of at most −10 ARS schedules the same pulse into the **two PPL101 (γ1pedc)** cells. The pulse is binary above the threshold, not proportional to profit. The deadband is per observation; tiny changes are not accumulated into a later pulse.
 
 This is feedback about portfolio value, not evidence that the latest action caused that change. Holding an asset can produce either signal. Fees count as a loss. Deposits or unexplained balance changes halt execution instead of becoming rewards. Positive P&L need not be realized profit.
 

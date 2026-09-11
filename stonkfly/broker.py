@@ -1,18 +1,30 @@
-"""Official Coinbase Advanced SDK execution, wrapped by an AgentKit provider.
+"""PPI (Portfolio Personal Inversiones) execution, and the paper double.
 
-Live execution uses price-bounded fill-or-kill spot orders. Intent is persisted
-before the request. An ambiguous result is never retried as a new order.
+PPI documents no immediate-or-cancel/FOK order term, so live execution submits
+a day limit order and force-cancels it at a bounded deadline if still resting,
+keeping the same bounded-risk shape the Guard's cooldown model assumes for
+crypto FOK orders. Intent is persisted before the request. An ambiguous result
+is never retried as a new order.
+
+Known documentation gaps that make PPIBroker best-effort, not verified:
+PPI's Order/Detail schema exposes only a single "quantity"/"amount" pair with
+no distinct filled-vs-requested field and no documented status enum, so a
+terminal order is inferred from its absence in Order/ActiveOrders rather than
+from a status string. There is also no commission field on Order/Detail, so
+fills are booked with zero fee; a real PPI account will charge a commission
+that this ledger will not see, and verify_balances() is expected to trip on
+the resulting mismatch. Both gaps must be resolved against real sandbox
+responses (Account/Movements is the natural cross-check) before --live is
+ever used.
 """
 
 import os
 import time
-from datetime import datetime, timezone
 
 from .config import D
-from .market import unwrap
 from .risk import Veto
 
-TERMINAL = {"FILLED", "CANCELLED", "EXPIRED", "FAILED", "REJECTED"}
+TERMINAL_WAIT_SECONDS = 30
 
 
 class UnresolvedOrder(RuntimeError):
@@ -61,137 +73,114 @@ class PaperBroker:
         }
 
 
-class CoinbaseBroker:
+class PPIBroker:
     mode = "live"
 
-    def __init__(self, settings, ledger, client, portfolio):
-        if not portfolio:
-            raise ValueError("Dedicated Coinbase portfolio UUID required")
+    def __init__(self, settings, ledger, client, account_number):
+        if not account_number:
+            raise ValueError("PPI account number required")
         self.s = settings
         self.l = ledger
         self.client = client
-        self.portfolio = portfolio
+        self.account_number = account_number
 
     @classmethod
     def from_env(cls, settings, ledger):
         if os.environ.get("STONKFLY_LIVE") != "I_ACCEPT_REAL_TRADES":
             raise RuntimeError("Live opt-in missing")
-        from coinbase.rest import RESTClient
+        account_number = os.environ.get("PPI_ACCOUNT_NUMBER")
+        if not account_number:
+            raise RuntimeError("Set PPI_ACCOUNT_NUMBER locally")
+        # Imported here, not at module load: paper/fixture runs construct
+        # PaperBroker and must never require httpx or any PPI-specific code.
+        from .ppi import PPIClient
 
-        key = os.environ.get("COINBASE_KEY_FILE")
-        portfolio = os.environ.get("COINBASE_PORTFOLIO_ID")
-        if not key or not portfolio:
-            raise RuntimeError(
-                "Set COINBASE_KEY_FILE and COINBASE_PORTFOLIO_ID locally"
-            )
-        return cls(
-            settings,
-            ledger,
-            RESTClient(api_key=None, api_secret=None, key_file=key, timeout=10),
-            portfolio,
-        )
+        return cls(settings, ledger, PPIClient.from_env(os.environ), account_number)
 
-    def accounts(self):
+    def balances(self):
+        # BalancesAndPositions' documented schema is one array of
+        # {currency, availability:[{name, simbol, amount, settlement}]} with
+        # no separate "positions" field; held instruments are inferred to be
+        # mixed into availability by simbol (unverified against real data).
+        rows = self.client.balances_and_positions(self.account_number)
         result = {}
-        cursor = None
-        seen = set()
-        while True:
-            d = unwrap(
-                self.client.get_accounts(
-                    limit=250, cursor=cursor, retail_portfolio_id=self.portfolio
-                )
-            )
-            for a in d.get("accounts", []):
-                if a.get("retail_portfolio_id") != self.portfolio:
-                    raise RuntimeError("Account portfolio mismatch")
-                currency = a["currency"]
-                available = D(a["available_balance"]["value"])
-                hold = D(a["hold"]["value"])
-                if min(available, hold) < 0 or hold:
-                    raise RuntimeError("Negative or reserved external account balance")
-                result[currency] = result.get(currency, D(0)) + available
-            if not d.get("has_next"):
-                break
-            cursor = d.get("cursor")
-            if not cursor or cursor in seen:
-                raise RuntimeError("Invalid account pagination")
-            seen.add(cursor)
+        for group in rows:
+            currency = group.get("currency")
+            for item in group.get("availability", []):
+                symbol = item.get("simbol") or currency
+                amount = D(item.get("amount", 0))
+                if amount < 0:
+                    raise RuntimeError("Negative external balance")
+                result[symbol] = result.get(symbol, D(0)) + amount
         return result
 
     def preflight(self):
-        permissions = unwrap(self.client.get_api_key_permissions())
-        if (
-            permissions.get("can_view") is not True
-            or permissions.get("can_trade") is not True
-            or permissions.get("can_transfer") is not False
-        ):
-            raise RuntimeError(
-                "Require View + Trade, with Transfer explicitly disabled"
-            )
-        if permissions.get("portfolio_uuid") != self.portfolio:
-            raise RuntimeError("API key is not scoped to the configured portfolio")
         self.reconcile()
-        balances = self.accounts()
+        balances = self.balances()
         if not self.l.get("live_initialized"):
             if (
                 self.l.get("tick")
                 or self.l.db.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
             ):
                 raise RuntimeError("Uninitialized live ledger already has activity")
-            if any(v for k, v in balances.items() if k != "USDC"):
-                raise RuntimeError("Start with only USDC in a dedicated portfolio")
-            cash = balances.get("USDC", D(0))
+            if any(v != 0 for k, v in balances.items() if k != "ARS"):
+                raise RuntimeError("Start with only ARS cash, no existing positions")
+            cash = balances.get("ARS", D(0))
             if not 0 < cash <= D(self.s.capital):
-                raise RuntimeError(
-                    "Fund dedicated portfolio with 0 < USDC <= configured $100 cap"
-                )
+                raise RuntimeError("Fund the account with 0 < ARS <= configured cap")
             with self.l.transaction():
                 for k in ["cash", "initial_cash", "anchor"]:
                     self.l.put(k, str(cash))
                 self.l.put("live_initialized", True)
         self.verify_balances()
-        return {"mode": "live", "portfolio_scoped": True, "withdrawals_disabled": True}
+        return {"mode": "live", "account_scoped": True}
 
     def verify_balances(self):
-        actual = self.accounts()
-        expected = {"USDC": self.l.cash}
+        actual = self.balances()
+        expected = {"ARS": self.l.cash}
         for p, amount in self.l.positions.items():
-            expected[p.split("-")[0]] = amount
-        for currency in set(actual) | set(expected):
-            tolerance = D(".02") if currency == "USDC" else D(".00000001")
-            if (
-                abs(actual.get(currency, D(0)) - expected.get(currency, D(0)))
-                > tolerance
-            ):
+            expected[p] = amount
+        for symbol in set(actual) | set(expected):
+            tolerance = D(".02") if symbol == "ARS" else D(0)
+            if abs(actual.get(symbol, D(0)) - expected.get(symbol, D(0))) > tolerance:
                 raise RuntimeError(
                     "External balance change; stop and reconcile rather than treat deposits as profit"
                 )
-        open_orders = unwrap(
-            self.client.list_orders(
-                order_status=["OPEN"], retail_portfolio_id=self.portfolio, limit=1
-            )
-        )
-        if open_orders.get("orders"):
-            raise RuntimeError("External/open order in dedicated portfolio")
+        if self._active_ids():
+            raise RuntimeError("External/open order on account")
+
+    def _active_ids(self):
+        return {str(o.get("id")) for o in self.client.active_orders(self.account_number)}
 
     def execute(self, p, before_submit):
         cid = p["client_order_id"]
+        instrument = self.s.instrument(p["product"])
         side = p["side"]
-        common = {
-            "product_id": p["product"],
-            "base_size": p["base_size"],
-            "limit_price": p["limit_price"],
-            "retail_portfolio_id": self.portfolio,
-        }
+        common = dict(
+            accountNumber=self.account_number,
+            ticker=instrument.ticker,
+            instrumentType=instrument.instrument_type,
+            settlement=instrument.settlement,
+            quantity=int(D(p["base_size"])),
+            price=float(D(p["limit_price"])),
+            quantityType="PAPELES",
+            operation="COMPRA" if side == "BUY" else "VENTA",
+            operationType=p["operation_type"],
+            operationTerm=p["operation_term"],
+            disclaimers=[],
+        )
         try:
-            preview = unwrap(self.client.preview_limit_order_fok(side=side, **common))
-            if preview.get("errs") or preview.get("warning"):
-                raise Veto("Coinbase preview rejected or warned")
-            if "commission_total" not in preview:
-                raise Veto("Preview did not include fees")
-            fee = D(preview["commission_total"])
-            if fee < 0 or fee > D(p["fee_ceiling"]):
-                raise Veto("Fee ceiling exceeded")
+            try:
+                # Budget is PPI's pre-trade check, analogous to a preview: it
+                # raises PPIError on rejection since no documented error
+                # schema exists to inspect for a soft-reject field. Treated
+                # as a Veto (skip this tick), not a halt, mirroring how a
+                # Coinbase preview rejection was handled.
+                self.client.budget(**common)
+            except Veto:
+                raise
+            except Exception as e:
+                raise Veto(f"PPI budget rejected: {e}") from e
             if time.time() - p["quote_timestamp"] > self.s.max_quote_age:
                 raise Veto("Quote expired during preview")
             self.verify_balances()
@@ -202,46 +191,65 @@ class CoinbaseBroker:
         # This durable transition precedes any request that can place an order.
         self.l.mark(cid, "UNKNOWN")
         try:
-            r = unwrap(
-                self.client.limit_order_fok(client_order_id=cid, side=side, **common)
-            )
+            r = self.client.confirm(**common, externalID=cid)
         except Exception as e:
             raise UnresolvedOrder(
                 "Submission outcome unknown; reconcile before any further trade"
             ) from e
-        if r.get("success") is False:
-            self.l.mark(cid, "REJECTED")
-            return {"status": "REJECTED", "mode": "live"}
-        oid = r.get("success_response", {}).get("order_id")
-        if r.get("success") is not True or not oid:
-            raise UnresolvedOrder("Exchange response lacks an unambiguous order ID")
-        self.l.mark(cid, "ACCEPTED", oid)
-        deadline = time.monotonic() + 30
-        while True:
-            if self._settle(cid, oid, p):
-                return {"mode": "live", "status": "SETTLED", "client_order_id": cid}
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(1)
-        # FOK should be terminal. Do not assume that a timeout implies no fill.
-        raise UnresolvedOrder("Order is not terminal; live execution stopped")
+        oid = r.get("id")
+        if not oid:
+            raise UnresolvedOrder("PPI response lacks an unambiguous order ID")
+        self.l.mark(cid, "ACCEPTED", str(oid))
+        return self._await_terminal(cid, oid, p)
 
-    def _settle(self, cid, oid, p):
-        r = unwrap(self.client.get_order(oid)).get("order", {})
-        if (
-            r.get("order_id") != oid
-            or r.get("client_order_id") != cid
-            or r.get("product_id") != p["product"]
-            or r.get("side") != p["side"]
-        ):
+    def _await_terminal(self, cid, oid, p):
+        deadline = time.monotonic() + TERMINAL_WAIT_SECONDS
+        cancelled = False
+        while True:
+            if str(oid) not in self._active_ids():
+                return self._finalize(cid, oid, p)
+            if time.monotonic() >= deadline:
+                if cancelled:
+                    raise UnresolvedOrder(
+                        "Order still active after cancel attempt; reconcile manually"
+                    )
+                try:
+                    self.client.cancel(self.account_number, order_id=oid, external_id=cid)
+                except Exception as e:
+                    raise UnresolvedOrder(
+                        "Cancel attempt failed after deadline; reconcile before any further trade"
+                    ) from e
+                cancelled = True
+                continue
+            time.sleep(1)
+
+    def _finalize(self, cid, oid, p):
+        detail = self.client.detail(order_id=oid, external_id=cid)
+        if str(detail.get("id")) != str(oid) or detail.get("externalID") != cid:
             raise UnresolvedOrder("Order identity mismatch")
-        if r.get("status") not in TERMINAL:
-            return False
-        for key in ["filled_size", "filled_value", "total_fees"]:
-            if key not in r:
-                raise UnresolvedOrder("Final order lacks fill/fee accounting")
-        self.l.settle(cid, r["filled_size"], r["filled_value"], r["total_fees"])
-        return True
+        expected_operation = "COMPRA" if p["side"] == "BUY" else "VENTA"
+        if detail.get("ticker") != p["product"] or detail.get("operation") != expected_operation:
+            raise UnresolvedOrder("Order identity mismatch")
+        for key in ["quantity", "amount"]:
+            if key not in detail:
+                raise UnresolvedOrder("Final order lacks fill accounting")
+        quantity = D(detail["quantity"])
+        amount = D(detail["amount"])
+        if quantity == 0:
+            # No documented status enum distinguishes cancelled/rejected/
+            # never-filled; zero quantity is the only unambiguous "no trade"
+            # signal available.
+            self.l.mark(cid, "REJECTED")
+            return {"mode": "live", "status": "REJECTED"}
+        if quantity > D(p["base_size"]):
+            raise UnresolvedOrder("Filled quantity exceeds requested size")
+        limit = D(p["limit_price"])
+        if p["side"] == "BUY" and amount > limit * quantity + D(".01"):
+            raise UnresolvedOrder("Buy fill exceeded limit price")
+        if p["side"] == "SELL" and amount + D(".01") < limit * quantity:
+            raise UnresolvedOrder("Sell fill below limit price")
+        self.l.settle(cid, quantity, amount, D(0))
+        return {"mode": "live", "status": "SETTLED", "client_order_id": cid}
 
     def reconcile(self):
         for row in self.l.pending():
@@ -253,36 +261,13 @@ class CoinbaseBroker:
                 self.l.mark(cid, "REJECTED")
                 continue
             if not oid:
-                cursor = None
-                seen = set()
-                found = []
-                while True:
-                    r = unwrap(
-                        self.client.list_orders(
-                            start_date=datetime.fromtimestamp(
-                                row["created"] - 60, timezone.utc
-                            ).isoformat(),
-                            retail_portfolio_id=self.portfolio,
-                            cursor=cursor,
-                            limit=100,
-                        )
-                    )
-                    found += [
-                        o
-                        for o in r.get("orders", [])
-                        if o.get("client_order_id") == cid
-                    ]
-                    if not r.get("has_next"):
-                        break
-                    cursor = r.get("cursor")
-                    if not cursor or cursor in seen:
-                        raise UnresolvedOrder("Order pagination failed")
-                    seen.add(cursor)
-                if len(found) != 1:
+                detail = self.client.detail(external_id=cid)
+                if detail.get("externalID") != cid or not detail.get("id"):
                     raise UnresolvedOrder(
-                        "Uncertain submission not uniquely found. Check Coinbase; no automatic resubmission."
+                        "Uncertain submission not found by externalID. Check PPI; no automatic resubmission."
                     )
-                oid = found[0]["order_id"]
-                self.l.mark(cid, "ACCEPTED", oid)
-            if not self._settle(cid, oid, p):
-                raise UnresolvedOrder("Order still pending at Coinbase")
+                oid = detail["id"]
+                self.l.mark(cid, "ACCEPTED", str(oid))
+            if str(oid) in self._active_ids():
+                raise UnresolvedOrder("Order still pending at PPI")
+            self._finalize(cid, oid, p)

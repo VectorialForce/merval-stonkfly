@@ -1,9 +1,9 @@
-"""Public Coinbase observations. Synthetic fixtures are explicit test inputs."""
+"""PPI (BYMA) observations. Synthetic fixtures are explicit test inputs."""
 
 import math
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from .config import D
@@ -15,11 +15,9 @@ class Quote:
     bid: Decimal
     ask: Decimal
     timestamp: float
-    base_increment: Decimal
-    quote_increment: Decimal
     price_increment: Decimal
     minimum_quote: Decimal
-    minimum_base: Decimal
+    lot_size: Decimal
 
     def __post_init__(self):
         if (
@@ -29,24 +27,21 @@ class Quote:
             or not math.isfinite(self.timestamp)
         ):
             raise ValueError("Invalid quote")
-        for k in [
-            "base_increment",
-            "quote_increment",
-            "price_increment",
-            "minimum_quote",
-            "minimum_base",
-        ]:
-            if not getattr(self, k).is_finite() or getattr(self, k) <= 0:
-                raise ValueError("Invalid market increment")
+        if not self.price_increment.is_finite() or self.price_increment <= 0:
+            raise ValueError("Invalid market increment")
+        if not self.minimum_quote.is_finite() or self.minimum_quote < 0:
+            raise ValueError("Invalid minimum notional")
+        if (
+            not self.lot_size.is_finite()
+            or self.lot_size <= 0
+            or self.lot_size != self.lot_size.to_integral_value()
+        ):
+            raise ValueError("Invalid lot size; MERVAL instruments trade in whole shares")
 
     def json(self):
         return {
             k: str(v) if isinstance(v, Decimal) else v for k, v in asdict(self).items()
         }
-
-
-def unwrap(value):
-    return value.to_dict() if hasattr(value, "to_dict") else value
 
 
 def utc_timestamp(value):
@@ -56,77 +51,69 @@ def utc_timestamp(value):
     return parsed.timestamp()
 
 
-class CoinbaseMarket:
-    def __init__(self, products, client=None):
-        if client is None:
-            from coinbase.rest import RESTClient
+class PPIMarket:
+    """PPI requires authenticated headers on every endpoint, including market
+    data; there is no unauthenticated real-data mode as there was for
+    Coinbase's public order book."""
 
-            # Override SDK environment defaults: public observations never need
-            # an account key, even when a live broker exists in this process.
-            client = RESTClient(api_key=None, api_secret=None, timeout=10)
+    def __init__(self, instruments, client):
         self.client = client
-        self.products = products
-        self.meta = {}
-        self.history = {p: [] for p in products}
+        self.instruments = instruments
+        self.history = {i.ticker: [] for i in instruments}
 
     def snapshot(self):
         result = {}
-        for product in self.products:
-            if not self.history[product]:
-                # Seed only completed, past one-minute candles. No future samples.
-                end = int(time.time() // 60) * 60
-                candles = unwrap(
-                    self.client.get_public_candles(
-                        product, str(end - 120 * 60), str(end), "ONE_MINUTE", limit=120
-                    )
-                ).get("candles", [])
+        now = time.time()
+        for instrument in self.instruments:
+            ticker = instrument.ticker
+            if not self.history[ticker]:
+                end = datetime.now(timezone.utc)
+                start = end - timedelta(hours=2)
+                bars = self.client.search(
+                    ticker,
+                    instrument.instrument_type,
+                    instrument.settlement,
+                    start.isoformat(),
+                    end.isoformat(),
+                )
                 past = sorted(
-                    (c for c in candles if int(c["start"]) < end),
-                    key=lambda c: int(c["start"]),
+                    (b for b in bars if utc_timestamp(b["date"]) < now),
+                    key=lambda b: utc_timestamp(b["date"]),
                 )
                 if not past:
-                    raise RuntimeError("No historical candles available")
-                self.history[product] = [float(D(c["close"])) for c in past]
-                if any(not math.isfinite(v) or v <= 0 for v in self.history[product]):
+                    raise RuntimeError("No historical bars available")
+                self.history[ticker] = [float(D(b["price"])) for b in past]
+                if any(not math.isfinite(v) or v <= 0 for v in self.history[ticker]):
                     raise RuntimeError("Invalid historical price")
-            # Refresh tradeability at every observation, not just startup.
-            m = unwrap(self.client.get_public_product(product))
-            self.meta[product] = m
-            if (
-                m.get("product_id") != product
-                or m.get("product_type") != "SPOT"
-                or m.get("quote_currency_id") != "USDC"
-            ):
-                raise RuntimeError("Unexpected product")
-            if any(
-                m.get(k, False)
-                for k in [
-                    "is_disabled",
-                    "trading_disabled",
-                    "cancel_only",
-                    "view_only",
-                    "limit_only",
-                    "auction_mode",
-                ]
-            ):
-                raise RuntimeError("Product unavailable for immediate spot execution")
-            b = unwrap(self.client.get_public_product_book(product, limit=1))[
-                "pricebook"
-            ]
-            if b.get("product_id") != product or not b.get("bids") or not b.get("asks"):
-                raise RuntimeError("Empty or mismatched book")
+            book = self.client.book(ticker, instrument.instrument_type, instrument.settlement)
+            bids = book.get("bids") or []
+            offers = book.get("offers") or []
+            if bids and offers:
+                bid, ask = D(bids[0]["price"]), D(offers[0]["price"])
+                stamp = utc_timestamp(book["date"]) if book.get("date") else now
+            else:
+                # Empty book is expected outside BYMA session hours. Fall back
+                # to last price with zero synthetic spread; Current's own
+                # timestamp is what lets the existing staleness veto in
+                # Guard.check keep the worker from trading a closed market,
+                # rather than inventing a separate session-hours system.
+                current = self.client.current(
+                    ticker, instrument.instrument_type, instrument.settlement
+                )
+                if not current.get("price") or not current.get("date"):
+                    raise RuntimeError("No book or current price available")
+                bid = ask = D(current["price"])
+                stamp = utc_timestamp(current["date"])
             quote = Quote(
-                product,
-                D(b["bids"][0]["price"]),
-                D(b["asks"][0]["price"]),
-                utc_timestamp(b["time"]),
-                D(m["base_increment"]),
-                D(m["quote_increment"]),
-                D(m.get("price_increment", m["quote_increment"])),
-                D(m["quote_min_size"]),
-                D(m["base_min_size"]),
+                ticker,
+                bid,
+                ask,
+                stamp,
+                D("0.01"),
+                D("0"),
+                D("1"),
             )
-            result[product] = quote
+            result[ticker] = quote
         return result
 
     def record(self, quotes):
@@ -138,33 +125,32 @@ class CoinbaseMarket:
 class FixtureMarket:
     """Deterministic prices for offline verification, never used in live mode."""
 
-    def __init__(self, products):
-        self.products = products
+    def __init__(self, instruments):
+        self.instruments = instruments
         self.tick = 0
-        self.history = {p: [] for p in products}
+        self.history = {i.ticker: [] for i in instruments}
 
     def snapshot(self):
-        base = {"BTC-USDC": 60000, "ETH-USDC": 2500, "SOL-USDC": 100}
+        base = {"GGAL": 5000, "YPF": 40000, "PAMP": 2000, "AAPL": 30000, "KO": 9000}
         quotes = {}
-        for j, p in enumerate(self.products):
-            price = D(base[p]) * D(1 + 0.025 * math.sin(self.tick * 0.6 + j))
-            quotes[p] = Quote(
-                p,
+        for j, instrument in enumerate(self.instruments):
+            ticker = instrument.ticker
+            price = D(base[ticker]) * D(1 + 0.025 * math.sin(self.tick * 0.6 + j))
+            quotes[ticker] = Quote(
+                ticker,
                 price * D(".9995"),
                 price * D("1.0005"),
                 time.time(),
-                D(".00000001"),
                 D(".01"),
-                D(".01"),
+                D("0"),
                 D("1"),
-                D(".00000001"),
             )
-            if not self.history[p]:
-                self.history[p] = [
-                    float(D(base[p]) * D(1 + 0.01 * math.sin(i * 0.4 + j)))
+            if not self.history[ticker]:
+                self.history[ticker] = [
+                    float(D(base[ticker]) * D(1 + 0.01 * math.sin(i * 0.4 + j)))
                     for i in range(80)
                 ]
         self.tick += 1
         return quotes
 
-    record = CoinbaseMarket.record
+    record = PPIMarket.record

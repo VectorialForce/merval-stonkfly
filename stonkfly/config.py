@@ -5,6 +5,31 @@ from dataclasses import asdict, dataclass
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 
+@dataclass(frozen=True)
+class Instrument:
+    ticker: str
+    instrument_type: str  # "ACCIONES" | "CEDEARS"
+    settlement: str = "INMEDIATA"
+    market: str = "BYMA"
+
+
+# Closed allowlist: a small mix of acciones lideres and CEDEARs, mirroring the
+# spirit of the previous 3-pair USDC crypto allowlist. Settlement/tick-size
+# conventions are not published by PPI's docs; INMEDIATA (CI) is the simplest,
+# most liquid default and should be reconciled against Configuration/Settlements
+# and SearchInstrument before any live use.
+INSTRUMENTS = {
+    i.ticker: i
+    for i in [
+        Instrument("GGAL", "ACCIONES"),
+        Instrument("YPF", "ACCIONES"),
+        Instrument("PAMP", "ACCIONES"),
+        Instrument("AAPL", "CEDEARS"),
+        Instrument("KO", "CEDEARS"),
+    ]
+}
+
+
 def D(value):
     if isinstance(value, bool):
         raise ValueError("Boolean is not money")
@@ -24,10 +49,10 @@ def up(value, step):
 
 @dataclass(frozen=True)
 class Settings:
-    products: tuple[str, ...] = ("BTC-USDC",)
-    capital: str = "100"
-    order_limit: str = "10"
-    loss_stop: str = "20"
+    products: tuple[str, ...] = ("GGAL",)
+    capital: str = "100000"
+    order_limit: str = "10000"
+    loss_stop: str = "20000"
     fee_reserve: str = "0.02"
     slippage: str = "0.005"
     spread_limit: str = "0.005"
@@ -38,7 +63,7 @@ class Settings:
     neural_bin_ms: float = 10
     pulse_ms: float = 200
     pulse_current: float = 20
-    reward_deadband: str = "0.01"
+    reward_deadband: str = "10"
     decoder_threshold_hz: float = 2
     paper_fee: str = "0.006"
     learning: bool = True
@@ -47,13 +72,13 @@ class Settings:
         if (
             not self.products
             or len(set(self.products)) != len(self.products)
-            or not set(self.products) <= set(("BTC-USDC", "ETH-USDC", "SOL-USDC"))
+            or not set(self.products) <= set(INSTRUMENTS)
         ):
-            raise ValueError("Only allowlisted USDC spot pairs")
-        if not 0 < D(self.capital) <= 100 or not 0 < D(self.order_limit) <= min(
-            D(self.capital), D(10)
+            raise ValueError("Only allowlisted MERVAL instruments")
+        if not 0 < D(self.capital) <= 100000 or not 0 < D(self.order_limit) <= min(
+            D(self.capital), D(10000)
         ):
-            raise ValueError("Maximum capital $100; maximum order $10")
+            raise ValueError("Maximum capital ARS 100,000; maximum order ARS 10,000")
         if not 0 < D(self.loss_stop) <= D(self.capital):
             raise ValueError("Invalid loss stop")
         if (
@@ -92,6 +117,9 @@ class Settings:
             for x in [self.neural_ms, self.neural_bin_ms, self.pulse_ms]
         ):
             raise ValueError("Neural intervals must be multiples of 0.1 ms")
+
+    def instrument(self, ticker):
+        return INSTRUMENTS[ticker]
 
     def signature(self):
         return hashlib.sha256(

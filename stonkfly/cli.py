@@ -37,6 +37,11 @@ def main():
         action="store_true",
         help="Synthetic offline market input; paper only",
     )
+    run.add_argument(
+        "--real-data",
+        action="store_true",
+        help="Paper trading against real PPI quotes; requires .env credentials, never submits orders",
+    )
     run.add_argument("--steps", type=int, default=0, help="0 keeps running")
     run.add_argument(
         "--fast",
@@ -52,8 +57,8 @@ def main():
     run.add_argument(
         "--products",
         nargs="+",
-        default=["BTC-USDC"],
-        choices=["BTC-USDC", "ETH-USDC", "SOL-USDC"],
+        default=["GGAL"],
+        choices=["GGAL", "YPF", "PAMP", "AAPL", "KO"],
     )
     run.add_argument("--neural-ms", type=float, default=500)
     status = sub.add_parser("status")
@@ -94,8 +99,10 @@ def main():
             )
         )
         return
-    if a.live and (a.fixture or a.fast):
-        p.error("Live mode forbids fixtures and fast replay")
+    if a.live and (a.fixture or a.fast or a.real_data):
+        p.error("Live mode forbids fixtures, fast replay and --real-data")
+    if a.real_data and a.fixture:
+        p.error("--real-data and --fixture are mutually exclusive")
     if a.steps < 0:
         p.error("steps cannot be negative")
     settings = Settings(
@@ -111,13 +118,13 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise SystemExit("A worker already owns this run directory")
-    from .broker import CoinbaseBroker, PaperBroker
+    from .broker import PaperBroker, PPIBroker
     from .ledger import Ledger
 
     ledger = Ledger(out / "ledger.sqlite", settings, "live" if a.live else "paper")
     try:
         broker = (
-            CoinbaseBroker.from_env(settings, ledger)
+            PPIBroker.from_env(settings, ledger)
             if a.live
             else PaperBroker(settings, ledger)
         )
@@ -141,20 +148,26 @@ def main():
 
         from .actions import StonkflyActions
         from .display import market_frame
-        from .market import CoinbaseMarket, FixtureMarket
+        from .market import FixtureMarket, PPIMarket
         from .neural.controller import FlyController
         from .reinforcement import reinforcement
         from .risk import Guard, Veto
 
-        market = (
-            FixtureMarket(settings.products)
-            if a.fixture
-            else CoinbaseMarket(settings.products)
-        )
+        instruments = [settings.instrument(t) for t in settings.products]
+        if a.live:
+            market = PPIMarket(instruments, broker.client)
+        elif a.real_data:
+            # Imported here, not at module load: a plain fixture/paper run
+            # must never require httpx or any PPI-specific code.
+            from .ppi import PPIClient
+
+            market = PPIMarket(instruments, PPIClient.from_env(os.environ))
+        else:
+            market = FixtureMarket(instruments)
         previous = ledger.get("observation")
         if previous:
             market.history = previous["market_history"]
-            if a.fixture:
+            if isinstance(market, FixtureMarket):
                 market.tick = previous["fixture_tick"]
         controller = FlyController(settings)
         cp = ledger.get("checkpoint")
@@ -169,7 +182,7 @@ def main():
             "circuit": controller.brain.circuit["report"],
             "vision": controller.brain.visual_report,
             "mode": broker.mode,
-            "feed": "fixture" if a.fixture else "coinbase-public",
+            "feed": "ppi-live" if a.live else "ppi-real-data" if a.real_data else "fixture",
             "decoder": "DNp20 mean R-L: buy/sell; DNpe017 spike gate; otherwise hold. Engineered fixed mapping.",
             "learning_validated": False,
             "pain_receptors_modeled": False,
@@ -193,7 +206,6 @@ def main():
         (out / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
         guard = Guard(settings, ledger, out / "STOP")
         provider = StonkflyActions(guard, broker)
-        action = provider.get_actions()[0]
         count = 0
         while not a.steps or count < a.steps:
             started = time.monotonic()
@@ -225,7 +237,7 @@ def main():
                 "neural": neural,
                 "product": product,
                 "quote": q.json(),
-                "pnl_delta_usdc": str(delta),
+                "pnl_delta_ars": str(delta),
                 "market_history": market.history,
                 "fixture_tick": getattr(market, "tick", None),
             }
@@ -239,7 +251,7 @@ def main():
                     if abs(latest.bid - q.bid) / q.bid > D(settings.slippage):
                         raise Veto("Price moved beyond neural observation tolerance")
                     provider.quotes = fresh
-                    order = action.invoke({"product": product, "side": neural["side"]})
+                    order = provider.invoke({"product": product, "side": neural["side"]})
                 except Veto as e:
                     order = {"status": "VETO", "reason": str(e)}
             row = {
@@ -248,8 +260,8 @@ def main():
                 "product": product,
                 "mode": broker.mode,
                 "quote": q.json(),
-                "equity_usdc": str(equity),
-                "pnl_delta_usdc": str(delta),
+                "equity_ars": str(equity),
+                "pnl_delta_ars": str(delta),
                 "neural": neural,
                 "execution": order,
             }

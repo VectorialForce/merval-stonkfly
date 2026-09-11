@@ -1,6 +1,6 @@
 # Validation status
 
-Recorded during implementation on 2026-09-09. All exchange-order tests use an in-memory SDK double; **no real orders or funded-account checks were performed**.
+Recorded during implementation on 2026-09-09, **against the Coinbase/crypto broker this repository has since replaced with PPI (MERVAL)**. The mechanism checks below (execution guard, checkpoint/reinforcement plumbing) still describe the current design, but the specific run and figures are from the retired crypto path and have not been repeated against PPI or real MERVAL prices; see the [PPI-specific gaps](operations.md#known-gaps-before-ever-using---live) before trusting anything execution-specific here. All exchange-order tests use an in-memory client double; **no real orders or funded-account checks were performed**.
 
 Final local result: **42 tests passed**, including the opt-in full-connectome test. An offline fixture run also resumed from its saved ledger/checkpoint with balances and neural time preserved. Four upstream AgentKit/Pydantic deprecation warnings remain; they did not fail the tests.
 
