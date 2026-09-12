@@ -69,12 +69,14 @@ class PPIMarket:
             if not self.history[ticker]:
                 end = datetime.now(timezone.utc)
                 start = end - timedelta(hours=2)
+                # The vendor SDK formats dateFrom/dateTo with plain str() of
+                # whatever it's given; pass datetime objects, not strings.
                 bars = self.client.search(
                     ticker,
                     instrument.instrument_type,
                     instrument.settlement,
-                    start.isoformat(),
-                    end.isoformat(),
+                    start,
+                    end,
                 )
                 past = sorted(
                     (b for b in bars if utc_timestamp(b["date"]) < now),

@@ -1,13 +1,25 @@
-"""Thin synchronous PPI (Portfolio Personal Inversiones) REST client.
+"""Thin adapter over PPI's official `ppi_client` SDK (PyPI: ppi-client).
 
-PPI's public docs do not document an error response schema, nor do they
-render a concrete base server URL (the Swagger page resolves it client-side).
-Rather than hardcode a guessed host, the base URL is required configuration.
-Any non-2xx or unparsable response raises PPIError uniformly; callers must
-treat that as an unknown outcome, never as an implied failure or success.
+Hand-rolling REST calls against PPI's public docs proved unreliable: the docs
+never render a concrete base server URL, and real working examples in the
+vendor's own documentation revealed field values (`operation`, `quantityType`)
+that differ in casing from what the prose/enum listing implied. The vendor
+SDK is authoritative on all of this (base URLs, auth-header wiring, exact
+field casing) and is used here as a dependency, the same way the retired
+Coinbase integration depended on Coinbase's official SDK rather than a
+hand-rolled client.
+
+The vendor SDK itself raises bare `Exception` for any non-200 response (it
+does not use its own `ppi_exceptions` types), so every call here is wrapped
+into a single `PPIError` — callers must treat that uniformly as an unknown
+outcome, never as an implied failure or success.
 """
 
-import httpx
+from ppi_client.models.disclaimer import Disclaimer
+from ppi_client.models.order import Order
+from ppi_client.models.order_budget import OrderBudget
+from ppi_client.models.order_confirm import OrderConfirm
+from ppi_client.ppi import PPI
 
 
 class PPIError(RuntimeError):
@@ -15,161 +27,101 @@ class PPIError(RuntimeError):
 
 
 class PPIClient:
-    def __init__(self, base_url, version, authorized_client, client_key, api_key, api_secret, timeout=10):
-        if not base_url:
-            raise ValueError(
-                "PPI_BASE_URL is required; PPI's docs do not publish a fixed "
-                "sandbox/production host, request it with your API credentials"
-            )
-        self.base_url = base_url.rstrip("/")
-        self.version = version
-        self.authorized_client = authorized_client
-        self.client_key = client_key
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.http = httpx.Client(timeout=timeout)
-        self.access_token = None
-        self.refresh_token = None
-        self.expiration = 0
+    def __init__(self, sandbox, api_key, api_secret):
+        self._ppi = PPI(sandbox=sandbox)
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._logged_in = False
 
     @classmethod
     def from_env(cls, env):
-        missing = [
-            k
-            for k in [
-                "PPI_BASE_URL",
-                "PPI_AUTHORIZED_CLIENT",
-                "PPI_CLIENT_KEY",
-                "PPI_API_KEY",
-                "PPI_API_SECRET",
-            ]
-            if not env.get(k)
-        ]
+        missing = [k for k in ["PPI_API_KEY", "PPI_API_SECRET"] if not env.get(k)]
         if missing:
             raise RuntimeError(f"Missing PPI credentials: {', '.join(missing)}")
-        return cls(
-            base_url=env["PPI_BASE_URL"],
-            version=env.get("PPI_API_VERSION", "1.0"),
-            authorized_client=env["PPI_AUTHORIZED_CLIENT"],
-            client_key=env["PPI_CLIENT_KEY"],
-            api_key=env["PPI_API_KEY"],
-            api_secret=env["PPI_API_SECRET"],
-        )
+        sandbox = env.get("PPI_ENV", "sandbox") != "production"
+        return cls(sandbox, env["PPI_API_KEY"], env["PPI_API_SECRET"])
 
-    def _url(self, path):
-        return f"{self.base_url}/api/{self.version}/{path}"
-
-    def _raise_for_status(self, r):
-        if r.status_code < 200 or r.status_code >= 300:
-            raise PPIError(f"PPI {r.request.method} {r.request.url.path} -> {r.status_code}")
+    def _ensure_login(self):
+        if self._logged_in:
+            return
         try:
-            return r.json()
-        except ValueError as e:
-            raise PPIError("PPI response was not valid JSON") from e
+            self._ppi.account.login_api(self._api_key, self._api_secret)
+        except Exception as e:
+            raise PPIError(f"PPI login failed: {e}") from e
+        self._logged_in = True
 
-    def login(self):
-        r = self.http.post(
-            self._url("Account/LoginApi"),
-            headers={
-                "AuthorizedClient": self.authorized_client,
-                "ClientKey": self.client_key,
-                "ApiKey": self.api_key,
-                "ApiSecret": self.api_secret,
-            },
-        )
-        body = self._raise_for_status(r)
-        for key in ["accessToken", "refreshToken"]:
-            if not body.get(key):
-                raise PPIError("Login response missing token fields")
-        self.access_token = body["accessToken"]
-        self.refresh_token = body["refreshToken"]
-        self.expiration = body.get("expires") or 0
-        return body
-
-    def _refresh(self):
-        r = self.http.post(
-            self._url("Account/RefreshToken"),
-            headers={
-                "AuthorizedClient": self.authorized_client,
-                "ClientKey": self.client_key,
-            },
-            json={"refreshToken": self.refresh_token},
-        )
-        body = self._raise_for_status(r)
-        if not body.get("accessToken"):
-            raise PPIError("Refresh response missing accessToken")
-        self.access_token = body["accessToken"]
-        self.refresh_token = body.get("refreshToken", self.refresh_token)
-
-    def _request(self, method, path, retry=True, **kwargs):
-        if not self.access_token:
-            self.login()
-        headers = {
-            "AuthorizedClient": self.authorized_client,
-            "ClientKey": self.client_key,
-            "Authorization": f"Bearer {self.access_token}",
-        }
-        r = self.http.request(method, self._url(path), headers=headers, **kwargs)
-        if r.status_code == 401 and retry:
-            self._refresh()
-            return self._request(method, path, retry=False, **kwargs)
-        return self._raise_for_status(r)
+    def _call(self, fn, *a, **kw):
+        self._ensure_login()
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            raise PPIError(str(e)) from e
 
     def balances_and_positions(self, account_number):
-        return self._request(
-            "GET", "Account/BalancesAndPositions", params={"accountNumber": account_number}
-        )
+        return self._call(self._ppi.account.get_balance_and_positions, account_number)
 
     def current(self, ticker, instrument_type, settlement):
-        return self._request(
-            "GET",
-            "MarketData/Current",
-            params={"Ticker": ticker, "Type": instrument_type, "Settlement": settlement},
-        )
+        return self._call(self._ppi.marketdata.current, ticker, instrument_type, settlement)
 
     def book(self, ticker, instrument_type, settlement):
-        return self._request(
-            "GET",
-            "MarketData/Book",
-            params={"Ticker": ticker, "Type": instrument_type, "Settlement": settlement},
-        )
+        return self._call(self._ppi.marketdata.book, ticker, instrument_type, settlement)
 
     def search(self, ticker, instrument_type, settlement, date_from, date_to):
-        return self._request(
-            "GET",
-            "MarketData/Search",
-            params={
-                "Ticker": ticker,
-                "Type": instrument_type,
-                "Settlement": settlement,
-                "DateFrom": date_from,
-                "DateTo": date_to,
-            },
+        # date_from/date_to must be datetime objects, not strings: the vendor
+        # SDK builds the query string with plain str()/format(), so passing
+        # an already-formatted string would double-encode it incorrectly.
+        return self._call(
+            self._ppi.marketdata.search, ticker, instrument_type, settlement, date_from, date_to
         )
 
-    def budget(self, **body):
-        return self._request("POST", "Order/Budget", json=body)
+    def budget(self, **kw):
+        params = OrderBudget(
+            accountNumber=kw["accountNumber"],
+            quantity=kw["quantity"],
+            price=kw["price"],
+            ticker=kw["ticker"],
+            instrumentType=kw["instrumentType"],
+            quantityType=kw["quantityType"],
+            operationType=kw["operationType"],
+            operationTerm=kw["operationTerm"],
+            operationMaxDate=kw.get("operationMaxDate"),
+            operation=kw["operation"],
+            settlement=kw["settlement"],
+        )
+        return self._call(self._ppi.orders.budget, params)
 
-    def confirm(self, **body):
-        return self._request("POST", "Order/Confirm", json=body)
+    def confirm(self, **kw):
+        disclaimers = [
+            Disclaimer(code=d["code"], accepted=d.get("accepted", True))
+            for d in kw.get("disclaimers") or []
+        ]
+        params = OrderConfirm(
+            accountNumber=kw["accountNumber"],
+            quantity=kw["quantity"],
+            price=kw["price"],
+            ticker=kw["ticker"],
+            instrumentType=kw["instrumentType"],
+            quantityType=kw["quantityType"],
+            operationType=kw["operationType"],
+            operationTerm=kw["operationTerm"],
+            operationMaxDate=kw.get("operationMaxDate"),
+            operation=kw["operation"],
+            settlement=kw["settlement"],
+            disclaimers=disclaimers,
+            externalId=kw["externalID"],
+        )
+        return self._call(self._ppi.orders.confirm, params)
 
     def active_orders(self, account_number):
-        return self._request(
-            "GET", "Order/ActiveOrders", params={"accountNumber": account_number}
+        return self._call(self._ppi.orders.get_active_orders, account_number)
+
+    def detail(self, account_number, order_id=None, external_id=None):
+        return self._call(
+            self._ppi.orders.get_order_detail, account_number, order_id or "", external_id or ""
         )
 
-    def detail(self, order_id=None, external_id=None):
-        params = {}
-        if order_id is not None:
-            params["orderID"] = order_id
-        if external_id is not None:
-            params["externalID"] = external_id
-        return self._request("GET", "Order/Detail", params=params)
-
     def cancel(self, account_number, order_id=None, external_id=None):
-        body = {"accountNumber": account_number}
-        if order_id is not None:
-            body["orderID"] = order_id
-        if external_id is not None:
-            body["externalID"] = external_id
-        return self._request("POST", "Order/Cancel", json=body)
+        return self._call(
+            self._ppi.orders.cancel_order,
+            Order(id=order_id, account_number=account_number, externalId=external_id),
+        )

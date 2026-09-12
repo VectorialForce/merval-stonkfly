@@ -36,7 +36,7 @@ Over each observation, mean right DNp20 firing minus mean left DNp20 firing is d
 
 This is an engineered interface, not a discovery of “buy neurons.” The mapping is fixed and reads only spike counts. Selected cell IDs appear in the local audit log. Persistent turning-like network bias can therefore become persistent buying; do not interpret that as market insight.
 
-The guard can reject a proposal for price, budget, inventory, timing or account-state reasons. It cannot replace the proposal or manufacture a profitable policy. A small local client bridges the separate [PPI REST API](https://itatppi.github.io/ppi-official-api-docs/api/documentacionRest/); there is no general-purpose trading/wallet framework in between.
+The guard can reject a proposal for price, budget, inventory, timing or account-state reasons. It cannot replace the proposal or manufacture a profitable policy. PPI's official `ppi-client` SDK bridges the separate [PPI REST API](https://itatppi.github.io/ppi-official-api-docs/api/documentacionRest/); there is no general-purpose trading/wallet framework in between.
 
 ## What changes with profit and loss
 

@@ -98,20 +98,27 @@ class PPIBroker:
         return cls(settings, ledger, PPIClient.from_env(os.environ), account_number)
 
     def balances(self):
-        # BalancesAndPositions' documented schema is one array of
-        # {currency, availability:[{name, simbol, amount, settlement}]} with
-        # no separate "positions" field; held instruments are inferred to be
-        # mixed into availability by simbol (unverified against real data).
-        rows = self.client.balances_and_positions(self.account_number)
+        # BalancesAndPositions' response is an object with "groupedAvailability"
+        # (cash, keyed by "symbol") and "groupedInstruments" (holdings, keyed
+        # by "ticker") — the REST docs' page shows a flat array instead, but
+        # the vendor SDK's own example code (which is what actually runs)
+        # confirms this nested shape.
+        data = self.client.balances_and_positions(self.account_number)
         result = {}
-        for group in rows:
-            currency = group.get("currency")
+        for group in data.get("groupedAvailability", []):
             for item in group.get("availability", []):
-                symbol = item.get("simbol") or currency
+                symbol = item.get("symbol")
                 amount = D(item.get("amount", 0))
                 if amount < 0:
                     raise RuntimeError("Negative external balance")
                 result[symbol] = result.get(symbol, D(0)) + amount
+        for group in data.get("groupedInstruments", []):
+            for item in group.get("instruments", []):
+                ticker = item.get("ticker")
+                amount = D(item.get("amount", 0))
+                if amount < 0:
+                    raise RuntimeError("Negative external holding")
+                result[ticker] = result.get(ticker, D(0)) + amount
         return result
 
     def preflight(self):
@@ -123,11 +130,16 @@ class PPIBroker:
                 or self.l.db.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
             ):
                 raise RuntimeError("Uninitialized live ledger already has activity")
-            if any(v != 0 for k, v in balances.items() if k != "ARS"):
-                raise RuntimeError("Start with only ARS cash, no existing positions")
+            other = {k: str(v) for k, v in balances.items() if k != "ARS" and v != 0}
+            if other:
+                raise RuntimeError(
+                    f"Start with only ARS cash, no existing positions; saw {other}"
+                )
             cash = balances.get("ARS", D(0))
             if not 0 < cash <= D(self.s.capital):
-                raise RuntimeError("Fund the account with 0 < ARS <= configured cap")
+                raise RuntimeError(
+                    f"Fund the account with 0 < ARS <= configured cap; saw balances {dict((k, str(v)) for k, v in balances.items())}"
+                )
             with self.l.transaction():
                 for k in ["cash", "initial_cash", "anchor"]:
                     self.l.put(k, str(cash))
@@ -163,11 +175,10 @@ class PPIBroker:
             settlement=instrument.settlement,
             quantity=int(D(p["base_size"])),
             price=float(D(p["limit_price"])),
-            quantityType="PAPELES",
-            operation="COMPRA" if side == "BUY" else "VENTA",
+            quantityType="Papeles",
+            operation="Compra" if side == "BUY" else "Venta",
             operationType=p["operation_type"],
             operationTerm=p["operation_term"],
-            disclaimers=[],
         )
         try:
             try:
@@ -175,12 +186,17 @@ class PPIBroker:
                 # raises PPIError on rejection since no documented error
                 # schema exists to inspect for a soft-reject field. Treated
                 # as a Veto (skip this tick), not a halt, mirroring how a
-                # Coinbase preview rejection was handled.
-                self.client.budget(**common)
+                # Coinbase preview rejection was handled. Its response also
+                # carries the disclaimers Confirm requires to be individually
+                # accepted; there is no way to know them ahead of time.
+                budget = self.client.budget(**common)
             except Veto:
                 raise
             except Exception as e:
                 raise Veto(f"PPI budget rejected: {e}") from e
+            disclaimers = [
+                {"code": d["code"], "accepted": True} for d in budget.get("disclaimers") or []
+            ]
             if time.time() - p["quote_timestamp"] > self.s.max_quote_age:
                 raise Veto("Quote expired during preview")
             self.verify_balances()
@@ -191,7 +207,7 @@ class PPIBroker:
         # This durable transition precedes any request that can place an order.
         self.l.mark(cid, "UNKNOWN")
         try:
-            r = self.client.confirm(**common, externalID=cid)
+            r = self.client.confirm(**common, disclaimers=disclaimers, externalID=cid)
         except Exception as e:
             raise UnresolvedOrder(
                 "Submission outcome unknown; reconcile before any further trade"
@@ -224,10 +240,10 @@ class PPIBroker:
             time.sleep(1)
 
     def _finalize(self, cid, oid, p):
-        detail = self.client.detail(order_id=oid, external_id=cid)
+        detail = self.client.detail(self.account_number, order_id=oid, external_id=cid)
         if str(detail.get("id")) != str(oid) or detail.get("externalID") != cid:
             raise UnresolvedOrder("Order identity mismatch")
-        expected_operation = "COMPRA" if p["side"] == "BUY" else "VENTA"
+        expected_operation = "Compra" if p["side"] == "BUY" else "Venta"
         if detail.get("ticker") != p["product"] or detail.get("operation") != expected_operation:
             raise UnresolvedOrder("Order identity mismatch")
         for key in ["quantity", "amount"]:
@@ -261,7 +277,7 @@ class PPIBroker:
                 self.l.mark(cid, "REJECTED")
                 continue
             if not oid:
-                detail = self.client.detail(external_id=cid)
+                detail = self.client.detail(self.account_number, external_id=cid)
                 if detail.get("externalID") != cid or not detail.get("id"):
                     raise UnresolvedOrder(
                         "Uncertain submission not found by externalID. Check PPI; no automatic resubmission."

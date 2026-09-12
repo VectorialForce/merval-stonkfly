@@ -1,6 +1,6 @@
 # Running and stopping Stonkfly
 
-Use a dedicated PPI account. Stonkfly is an experiment capable of losing its entire allocated balance. The funding cap is **ARS 100,000 at initialization**, an arbitrary starting point for the experiment, not a claim about what that buys or how it holds value over time.
+Use a dedicated PPI account. Stonkfly is an experiment capable of losing its entire allocated balance. The funding cap is **ARS 100,000 at initialization**, an arbitrary starting point for the experiment, not a claim about what that buys or how it holds value over time. The account must start ARS-only: any non-ARS balance, and any existing instrument position, blocks initialization.
 
 ## Installation and data
 
@@ -25,8 +25,10 @@ python -m stonkfly run --fixture --fast --frozen --steps 10 --out runs/frozen
 
 ## PPI setup, performed by you
 
-1. Get PPI API credentials (sandbox or production): `AuthorizedClient`, `ClientKey`, `ApiKey`, `ApiSecret`, your account number, and the base server URL — PPI's docs don't publish a fixed hostname, so get it from your dashboard/sandbox invitation alongside the credentials.
-2. Copy `.env.example` to `.env` and fill in `PPI_BASE_URL`, `PPI_AUTHORIZED_CLIENT`, `PPI_CLIENT_KEY`, `PPI_API_KEY`, `PPI_API_SECRET`. This alone is enough for `--real-data` paper mode.
+Execution goes through PPI's official `ppi-client` Python SDK (PyPI: `ppi-client`), not a hand-rolled HTTP client — it's the vendor's own maintained library, and it's authoritative on base URLs and request details that PPI's public docs leave ambiguous or get subtly wrong. `AuthorizedClient`/`ClientKey` are internal constants the SDK supplies itself for both sandbox and production; you never need or set them.
+
+1. Get your PPI API key/secret (`Gestiones -> Gestión de servicio API` in your account for production; sandbox testing credentials arrive by email) and your account number.
+2. Copy `.env.example` to `.env` and fill in `PPI_API_KEY`, `PPI_API_SECRET` (`PPI_ENV` defaults to `sandbox`; set it to `production` for a real account). This alone is enough for `--real-data` paper mode.
 3. For `--live`, additionally set `PPI_ACCOUNT_NUMBER` and `STONKFLY_LIVE=I_ACCEPT_REAL_TRADES`. The CLI also requires `--live`; paper mode never submits an order even if the environment variable is present.
 4. Run `python -m stonkfly run --live --preflight-only`. This reads balances/positions and open orders, and initializes the local ledger. **It does not submit orders.** Once you have reviewed the configuration, run `python -m stonkfly run --live` yourself.
 
@@ -34,15 +36,17 @@ Defaults trade `GGAL`; `YPF`, `PAMP`, `AAPL` and `KO` (CEDEARs and acciones líd
 
 ### Known gaps before ever using `--live`
 
-PPI's public API docs are considerably thinner than Coinbase's on exactly the details this program depends on for correctness. Concretely, unverified against a real sandbox account:
+Even with the official SDK doing the request plumbing, PPI's public docs are considerably thinner than Coinbase's on some details this program depends on for correctness. Concretely, unverified against a real account:
 
 - **No documented order status enum.** A terminal order is inferred from its absence in `Order/ActiveOrders`, not from a status string.
 - **No documented fill-vs-requested-quantity split.** `Order/Detail`'s `quantity`/`amount` fields are assumed to reflect the actual fill; a genuine partial fill cannot currently be distinguished from a full fill.
 - **No documented commission field.** Fills are booked with zero fee. A real PPI account will charge a commission this ledger will not see, and `verify_balances()` is expected to trip on the resulting mismatch — that is the intended fail-safe, not a bug, but it means `--live` is not yet usable end-to-end.
-- **No documented immediate-or-cancel/FOK order term.** A day limit order (`POR-EL-DÍA`) is submitted and force-cancelled at a 30-second deadline if still resting, to keep the same bounded-risk shape the cooldown/veto model assumes.
-- **`BalancesAndPositions`' schema is inferred**, not documented, to mix cash and security holdings into one array by `simbol`.
+- **No documented immediate-or-cancel/FOK order term.** A day limit order (`PRECIO-LIMITE` / `POR-EL-DÍA`) is submitted and force-cancelled at a 30-second deadline if still resting, to keep the same bounded-risk shape the cooldown/veto model assumes.
+- **`BalancesAndPositions`' actual shape** (`groupedAvailability` for cash, `groupedInstruments` for holdings) came from the vendor SDK's own example code, not PPI's REST docs page — that page shows a flat array that doesn't match what the API actually returns.
 
-Do not use `--live` until these are checked against real sandbox responses, ideally cross-referenced with `Account/Movements`.
+`Order/Confirm` also requires each disclaimer `Order/Budget` returns to be individually accepted (`{"code", "accepted": true}`); `execute()` does this automatically by accepting every disclaimer Budget returns, without showing you their text first — that's an experiment-automation tradeoff, not something PPI lets you skip.
+
+Do not use `--live` until the still-unverified items above are checked against a real account, ideally cross-referenced with `Account/Movements`.
 
 ## Execution guarantees and limits
 

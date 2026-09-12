@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "An experimental fly-connectome controller with guarded PPI (MERVAL) trading actions"
 requires-python = ">=3.11"
 dependencies = [
-  "httpx==0.28.1",
+  "ppi-client==1.3.0",
   "numpy==2.4.6", "pandas==3.0.5", "pyarrow==25.0.1", "Pillow==12.3.0",
   "pydantic==2.13.5", "python-dotenv==1.2.3"
 ]

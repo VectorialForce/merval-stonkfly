@@ -172,15 +172,18 @@ class FakePPIClient:
         self.stuck_orders = False
 
     def balances_and_positions(self, account_number):
-        return [
-            {
-                "currency": "ARS",
-                "availability": [
-                    {"name": "Disponible", "simbol": None, "amount": str(self.cash), "settlement": "INMEDIATA"},
-                    {"name": "GGAL", "simbol": "GGAL", "amount": str(self.ggal), "settlement": "INMEDIATA"},
-                ],
-            }
-        ]
+        return {
+            "groupedAvailability": [
+                {
+                    "availability": [
+                        {"name": "Disponible", "symbol": "ARS", "amount": str(self.cash), "settlement": "INMEDIATA"}
+                    ]
+                }
+            ],
+            "groupedInstruments": [
+                {"name": "Acciones", "instruments": [{"ticker": "GGAL", "price": "0", "amount": str(self.ggal)}]}
+            ],
+        }
 
     def active_orders(self, account_number):
         return [{"id": o["id"]} for o in self.orders.values() if o["active"]] + list(
@@ -192,7 +195,10 @@ class FakePPIClient:
         self.after_budget()
         if self.budget_should_raise:
             raise PPIError("rejected")
-        return {"amount": kw["quantity"] * kw["price"]}
+        return {
+            "amount": kw["quantity"] * kw["price"],
+            "disclaimers": [{"code": "D1", "accepted": False}],
+        }
 
     def confirm(self, **kw):
         self.submissions += 1
@@ -215,7 +221,7 @@ class FakePPIClient:
             raise TimeoutError("Response lost after accepted order")
         return {"id": oid}
 
-    def detail(self, order_id=None, external_id=None):
+    def detail(self, account_number, order_id=None, external_id=None):
         if order_id is not None:
             o = self.orders.get(order_id)
         else:
