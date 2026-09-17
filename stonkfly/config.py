@@ -22,7 +22,7 @@ class Instrument:
 # and SearchInstrument before any live use.
 _DEFAULT_INSTRUMENTS = [
     Instrument("GGAL", "ACCIONES"),
-    Instrument("YPF", "ACCIONES"),
+    Instrument("YPFD", "ACCIONES"),  # YPF's peso-settlement ticker; PPI has no bare "YPF"
     Instrument("PAMP", "ACCIONES"),
     Instrument("AAPL", "CEDEARS"),
     Instrument("KO", "CEDEARS"),
@@ -50,24 +50,32 @@ def _load_instruments():
 INSTRUMENTS = {i.ticker: i for i in _load_instruments()}
 
 
+_SWEEP_TERMS = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
 def refresh_instruments(env=None):
     """Fetch every BYMA ACCIONES listing via PPI SearchInstrument and cache it.
 
-    Requires PPI credentials; not used by paper/fixture runs. PPI's response
-    schema for this endpoint isn't documented (see stonkfly/ppi.py), so this
-    fails loudly on an unrecognized shape rather than silently building a
-    wrong or partial allowlist.
+    SearchInstrument is a substring search, not a listing endpoint: PPI
+    rejects a blank ticker/name ("Field 'Ticker' is required"), so there is
+    no single call that returns everything. Every BYMA ticker/description
+    contains at least one letter or digit, so sweeping single-character
+    queries across the alphabet and digits and taking the union of results
+    (by ticker) recovers the full panel. Requires PPI credentials; not used
+    by paper/fixture runs.
     """
     from .ppi import PPIClient
 
     client = PPIClient.from_env(env if env is not None else os.environ)
-    rows = client.search_instrument("", "", "BYMA", "ACCIONES")
     seen = {}
-    for row in rows:
-        ticker = row.get("ticker") or row.get("Ticker") or row.get("symbol")
-        if not ticker:
-            raise RuntimeError(f"SearchInstrument row has no recognizable ticker field: {row}")
-        seen[ticker] = Instrument(ticker, "ACCIONES", market="BYMA")
+    for term in _SWEEP_TERMS:
+        for row in client.search_instrument(term, term, "BYMA", "ACCIONES"):
+            ticker = row.get("ticker")
+            if not ticker:
+                raise RuntimeError(f"SearchInstrument row has no ticker field: {row}")
+            if row.get("type") != "ACCIONES" or row.get("market") != "BYMA":
+                continue
+            seen[ticker] = Instrument(ticker, "ACCIONES", market="BYMA")
     if not seen:
         raise RuntimeError("PPI SearchInstrument returned no BYMA ACCIONES instruments")
     ordered = sorted(seen.values(), key=lambda i: i.ticker)
