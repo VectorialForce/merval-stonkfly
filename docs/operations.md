@@ -1,6 +1,6 @@
 # Running and stopping Stonkfly
 
-Use a dedicated PPI account. Stonkfly is an experiment capable of losing its entire allocated balance. The funding cap is **ARS 100,000 at initialization**, an arbitrary starting point for the experiment, not a claim about what that buys or how it holds value over time. The account must start ARS-only: any non-ARS balance, and any existing instrument position, blocks initialization.
+Use a dedicated PPI account. Stonkfly is an experiment capable of losing its entire allocated balance. The funding cap is **ARS 100,000 at initialization**, an arbitrary starting point for the experiment, not a claim about what that buys or how it holds value over time. The account must start ARS-only: any non-ARS balance, and any existing instrument position, blocks initialization — except USD residue up to 1.00, tolerated as unconvertible funding dust (e.g. leftover cents from a USD→ARS conversion) rather than a real position to reconcile against. The same dust tolerance applies to `verify_balances()` on every tick, not just at initialization.
 
 ## Installation and data
 
@@ -64,6 +64,8 @@ The worker must stay running on your computer/server. It is not a hosted service
 `runs/<name>/` holds a SQLite ledger, two alternating checkpoints, `events.jsonl`, `latest.json`, `latest-input.png`, and provenance with exact code, graph, stimulus and parameter hashes. Each intent binds to the preceding neural observation and checkpoint. The ledger is authoritative if a crash occurs before the human-readable log is written.
 
 To stop: Ctrl-C, or `touch runs/live/STOP` (`runs/paper/STOP` for paper). This stops future decisions/submissions; an already submitted order may still finish or still be resting. Inspect any uncertain order in PPI before taking another action.
+
+On a halt, the console prints a redacted stop reason by default; `--debug` prints the real exception and traceback to stderr instead, which can include account/request details — only use it in a terminal you trust, and never paste that output elsewhere.
 
 For an ordinary clean restart, use the same command and run directory. After reviewing a transient failure and reconciling account state, remove the STOP file if appropriate and pass `--resume-reviewed`. This cannot clear a drawdown or fee-overrun stop, bypass unresolved exchange outcomes, or accept changed source/configuration. A missing unknown order requires manual exchange investigation; do not assume it failed. Source changes require an explicitly reviewed state migration; use a fresh **paper** directory for development.
 
