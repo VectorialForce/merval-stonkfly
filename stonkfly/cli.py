@@ -33,6 +33,13 @@ def main():
         help="After manual review, clear a transient halt only after successful reconciliation",
     )
     run.add_argument(
+        "--debug",
+        action="store_true",
+        help="On a halt, print the real exception and traceback to stderr instead "
+        "of the redacted message; this may include account/request details, "
+        "so only use it in a terminal you trust and never paste the output elsewhere",
+    )
+    run.add_argument(
         "--fixture",
         action="store_true",
         help="Synthetic offline market input; paper only",
@@ -314,6 +321,13 @@ def main():
             f"Stopped safely: {type(e).__name__}. Inspect local state and reconcile before restarting.",
             file=sys.stderr,
         )
+        if a.debug:
+            print(
+                "--debug: real exception below; it may include account/request "
+                "details, so treat this terminal output as sensitive.",
+                file=sys.stderr,
+            )
+            traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)
         raise SystemExit(1) from None
     finally:
         ledger.close()

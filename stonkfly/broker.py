@@ -75,6 +75,10 @@ class PaperBroker:
 
 class PPIBroker:
     mode = "live"
+    # Currency residue below these amounts is ignored as unconvertible funding
+    # dust (e.g. leftover cents from a USD->ARS conversion), not a real
+    # external position the strategy needs to reconcile against.
+    DUST_TOLERANCE = {"USD": D("1.00")}
 
     def __init__(self, settings, ledger, client, account_number):
         if not account_number:
@@ -130,7 +134,11 @@ class PPIBroker:
                 or self.l.db.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
             ):
                 raise RuntimeError("Uninitialized live ledger already has activity")
-            other = {k: str(v) for k, v in balances.items() if k != "ARS" and v != 0}
+            other = {
+                k: str(v)
+                for k, v in balances.items()
+                if k != "ARS" and v > self.DUST_TOLERANCE.get(k, D(0))
+            }
             if other:
                 raise RuntimeError(
                     f"Start with only ARS cash, no existing positions; saw {other}"
@@ -153,7 +161,9 @@ class PPIBroker:
         for p, amount in self.l.positions.items():
             expected[p] = amount
         for symbol in set(actual) | set(expected):
-            tolerance = D(".02") if symbol == "ARS" else D(0)
+            tolerance = (
+                D(".02") if symbol == "ARS" else self.DUST_TOLERANCE.get(symbol, D(0))
+            )
             if abs(actual.get(symbol, D(0)) - expected.get(symbol, D(0))) > tolerance:
                 raise RuntimeError(
                     "External balance change; stop and reconcile rather than treat deposits as profit"
