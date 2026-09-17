@@ -11,7 +11,7 @@ import time
 import traceback
 from pathlib import Path
 
-from .config import D, Settings
+from .config import D, INSTRUMENTS, Settings
 
 
 def main():
@@ -20,6 +20,15 @@ def main():
     prep = sub.add_parser("prepare")
     prep.add_argument("--reuse-doomfly", type=Path)
     sub.add_parser("verify")
+    instruments_cmd = sub.add_parser(
+        "instruments", help="Show or refresh the tradable instrument allowlist"
+    )
+    instruments_cmd.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Fetch every BYMA ACCIONES listing via PPI SearchInstrument and cache it "
+        "in data/instruments.json; requires .env PPI credentials",
+    )
     run = sub.add_parser("run")
     run.add_argument("--live", action="store_true")
     run.add_argument(
@@ -65,7 +74,8 @@ def main():
         "--products",
         nargs="+",
         default=["GGAL"],
-        choices=["GGAL", "YPF", "PAMP", "AAPL", "KO"],
+        help="Tickers to trade, or the single value ALL to trade every instrument "
+        "in the current allowlist (see `stonkfly instruments`)",
     )
     run.add_argument("--neural-ms", type=float, default=500)
     status = sub.add_parser("status")
@@ -82,6 +92,15 @@ def main():
             prepare(a.reuse_doomfly)
         else:
             print(json.dumps(verify()))
+        return
+    if a.command == "instruments":
+        from .config import refresh_instruments
+
+        if a.refresh:
+            n = refresh_instruments()
+            print(json.dumps({"cached": n, "path": "data/instruments.json"}))
+        else:
+            print(json.dumps(sorted(INSTRUMENTS)))
         return
     if a.command == "status":
         import sqlite3
@@ -112,8 +131,9 @@ def main():
         p.error("--real-data and --fixture are mutually exclusive")
     if a.steps < 0:
         p.error("steps cannot be negative")
+    products = tuple(INSTRUMENTS) if a.products == ["ALL"] else tuple(a.products)
     settings = Settings(
-        products=tuple(a.products),
+        products=products,
         learning=not a.frozen,
         neural_ms=a.neural_ms,
         pulse_ms=min(200, a.neural_ms),

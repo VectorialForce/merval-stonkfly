@@ -1,7 +1,0 @@
-# Stonkfly artwork
-
-Generated with the built-in image generation tool for this repository. Final asset: `assets/stonkfly.png`. The chart is decorative concept art, not a trading result.
-
-## Final prompt
-
-Use case: stylized-concept. Asset type: wide GitHub repository hero, approximately 2:1 landscape. Create beautiful crisp hand-crafted 8-bit/16-bit pixel art for a project named STONKFLY. Use the attached image ONLY as a character reference: the same gray fruit fly with large dark ruby red compound eyes, six delicate legs and translucent silver veined wings. No desk or monitor from the reference. Place this fly in a strong three-quarter side pose on the left half, fully visible, wings angled gracefully backward. Black and midnight-navy background. Behind it, restrained cyan/green and coral/red candlestick chart bars with fine deep-blue grid, without any axis labels or profits. Sparse electric cobalt-blue rim lighting, a few pixel glints. On the right, exact text STONKFLY in bold white block-pixel lettering. Below in smaller pixel lettering: A FLY-CONNECTOME TRADING EXPERIMENT. Visually polished, playful but scientific, stark high contrast, minimal composition, space around all elements, nice enough as a share card. Actual pixel blocks and intentional dithering, no smudged gradients, no photorealism, no Coinbase or third-party logos, no fake returns, no extra slogans, no terminal screenshots, no border. The only text should be the two specified strings.

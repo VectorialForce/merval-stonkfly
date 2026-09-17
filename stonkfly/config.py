@@ -1,8 +1,10 @@
 import hashlib
 import json
 import math
+import os
 from dataclasses import asdict, dataclass
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -13,21 +15,67 @@ class Instrument:
     market: str = "BYMA"
 
 
-# Closed allowlist: a small mix of acciones lideres and CEDEARs, mirroring the
+# Small built-in default: a mix of acciones lideres and CEDEARs, mirroring the
 # spirit of the previous 3-pair USDC crypto allowlist. Settlement/tick-size
 # conventions are not published by PPI's docs; INMEDIATA (CI) is the simplest,
 # most liquid default and should be reconciled against Configuration/Settlements
 # and SearchInstrument before any live use.
-INSTRUMENTS = {
-    i.ticker: i
-    for i in [
-        Instrument("GGAL", "ACCIONES"),
-        Instrument("YPF", "ACCIONES"),
-        Instrument("PAMP", "ACCIONES"),
-        Instrument("AAPL", "CEDEARS"),
-        Instrument("KO", "CEDEARS"),
-    ]
-}
+_DEFAULT_INSTRUMENTS = [
+    Instrument("GGAL", "ACCIONES"),
+    Instrument("YPF", "ACCIONES"),
+    Instrument("PAMP", "ACCIONES"),
+    Instrument("AAPL", "CEDEARS"),
+    Instrument("KO", "CEDEARS"),
+]
+
+# `stonkfly instruments --refresh` fetches the full BYMA ACCIONES panel via
+# PPI's SearchInstrument endpoint and caches it here, replacing the small
+# built-in default above with every listed stock. Kept outside the package
+# (alongside the other fetched/verified datasets in data/) rather than in the
+# neural dataset's own sources.lock.json family, since this is a live listing
+# that changes over time, not a hash-verified fixed dataset.
+_CACHE_PATH = Path(__file__).resolve().parent.parent / "data" / "instruments.json"
+
+
+def _load_instruments():
+    if _CACHE_PATH.exists():
+        rows = json.loads(_CACHE_PATH.read_text())
+        instruments = [Instrument(**row) for row in rows]
+        if not instruments:
+            raise RuntimeError(f"{_CACHE_PATH} is empty; delete it or refresh it")
+        return instruments
+    return list(_DEFAULT_INSTRUMENTS)
+
+
+INSTRUMENTS = {i.ticker: i for i in _load_instruments()}
+
+
+def refresh_instruments(env=None):
+    """Fetch every BYMA ACCIONES listing via PPI SearchInstrument and cache it.
+
+    Requires PPI credentials; not used by paper/fixture runs. PPI's response
+    schema for this endpoint isn't documented (see stonkfly/ppi.py), so this
+    fails loudly on an unrecognized shape rather than silently building a
+    wrong or partial allowlist.
+    """
+    from .ppi import PPIClient
+
+    client = PPIClient.from_env(env if env is not None else os.environ)
+    rows = client.search_instrument("", "", "BYMA", "ACCIONES")
+    seen = {}
+    for row in rows:
+        ticker = row.get("ticker") or row.get("Ticker") or row.get("symbol")
+        if not ticker:
+            raise RuntimeError(f"SearchInstrument row has no recognizable ticker field: {row}")
+        seen[ticker] = Instrument(ticker, "ACCIONES", market="BYMA")
+    if not seen:
+        raise RuntimeError("PPI SearchInstrument returned no BYMA ACCIONES instruments")
+    ordered = sorted(seen.values(), key=lambda i: i.ticker)
+    _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _CACHE_PATH.write_text(json.dumps([asdict(i) for i in ordered], indent=2) + "\n")
+    global INSTRUMENTS
+    INSTRUMENTS = {i.ticker: i for i in ordered}
+    return len(INSTRUMENTS)
 
 
 def D(value):

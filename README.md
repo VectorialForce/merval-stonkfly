@@ -1,5 +1,3 @@
-![Stonkfly: a pixel fly beside a candlestick chart](assets/stonkfly.png)
-
 # Stonkfly
 
 A fly-connectome simulation that can operate a MERVAL trading account. Actual neural output, actual PPI (Portfolio Personal Inversiones) integration. Profitable learning has not been demonstrated.

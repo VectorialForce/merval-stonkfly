@@ -1,5 +1,6 @@
 """PPI (BYMA) observations. Synthetic fixtures are explicit test inputs."""
 
+import hashlib
 import math
 import time
 from dataclasses import asdict, dataclass
@@ -7,6 +8,14 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from .config import D
+
+
+def _synthetic_base_price(ticker):
+    """Deterministic per-ticker base price, so the fixture works for any
+    instrument (including a large fetched allowlist) without a hand-maintained
+    price table."""
+    seed = int(hashlib.sha256(ticker.encode()).hexdigest(), 16)
+    return 500 + (seed % 49500)
 
 
 @dataclass(frozen=True)
@@ -133,11 +142,11 @@ class FixtureMarket:
         self.history = {i.ticker: [] for i in instruments}
 
     def snapshot(self):
-        base = {"GGAL": 5000, "YPF": 40000, "PAMP": 2000, "AAPL": 30000, "KO": 9000}
         quotes = {}
         for j, instrument in enumerate(self.instruments):
             ticker = instrument.ticker
-            price = D(base[ticker]) * D(1 + 0.025 * math.sin(self.tick * 0.6 + j))
+            base = _synthetic_base_price(ticker)
+            price = D(base) * D(1 + 0.025 * math.sin(self.tick * 0.6 + j))
             quotes[ticker] = Quote(
                 ticker,
                 price * D(".9995"),
@@ -149,7 +158,7 @@ class FixtureMarket:
             )
             if not self.history[ticker]:
                 self.history[ticker] = [
-                    float(D(base[ticker]) * D(1 + 0.01 * math.sin(i * 0.4 + j)))
+                    float(D(base) * D(1 + 0.01 * math.sin(i * 0.4 + j)))
                     for i in range(80)
                 ]
         self.tick += 1

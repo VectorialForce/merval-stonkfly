@@ -66,6 +66,11 @@ class PPIClient:
     def book(self, ticker, instrument_type, settlement):
         return self._call(self._ppi.marketdata.book, ticker, instrument_type, settlement)
 
+    def search_instrument(self, ticker, instrument_name, market, instrument_type):
+        return self._call(
+            self._ppi.marketdata.search_instrument, ticker, instrument_name, market, instrument_type
+        )
+
     def search(self, ticker, instrument_type, settlement, date_from, date_to):
         # date_from/date_to must be datetime objects, not strings: the vendor
         # SDK builds the query string with plain str()/format(), so passing
