@@ -76,10 +76,17 @@ class PPIMarket:
         for instrument in self.instruments:
             ticker = instrument.ticker
             if not self.history[ticker]:
-                end = datetime.now(timezone.utc)
-                start = end - timedelta(hours=2)
                 # The vendor SDK formats dateFrom/dateTo with plain str() of
-                # whatever it's given; pass datetime objects, not strings.
+                # whatever it's given, then never URL-encodes the result. A
+                # tz-aware datetime's str() ends in "+00:00", and PPI decodes
+                # a literal "+" in the query string as a space (the standard
+                # application/x-www-form-urlencoded convention), so the
+                # offset silently mangles into "2026-09-18 14:03:49 00:00"
+                # server-side and PPI rejects it as an invalid date. Pass
+                # naive UTC datetimes (same instant, no "+00:00" to mangle)
+                # instead of timezone-aware ones.
+                end = datetime.now(timezone.utc).replace(tzinfo=None)
+                start = end - timedelta(hours=2)
                 bars = self.client.search(
                     ticker,
                     instrument.instrument_type,

@@ -253,18 +253,28 @@ class PPIBroker:
         detail = self.client.detail(self.account_number, order_id=oid, external_id=cid)
         if str(detail.get("id")) != str(oid) or detail.get("externalID") != cid:
             raise UnresolvedOrder("Order identity mismatch")
-        expected_operation = "Compra" if p["side"] == "BUY" else "Venta"
+        # Confirmed against a real order: PPI's Detail returns "operation" in
+        # upper case ("COMPRA"/"VENTA"), unlike the title-case value this same
+        # code submits as the request's "operation" field.
+        expected_operation = "COMPRA" if p["side"] == "BUY" else "VENTA"
         if detail.get("ticker") != p["product"] or detail.get("operation") != expected_operation:
             raise UnresolvedOrder("Order identity mismatch")
+        # Confirmed against a real cancelled order: Detail's quantity/amount
+        # reflect the originally *requested* size even when nothing filled
+        # ("1"/"6778.73" for an order that never executed), so quantity==0 is
+        # not the reliable no-fill signal the code previously assumed before
+        # any live order had been observed. "CANCELADA" is a confirmed
+        # terminal no-fill status; "RECHAZADA" is the plausible rejected
+        # counterpart but is unconfirmed against a real response.
+        if detail.get("status") in ("CANCELADA", "RECHAZADA"):
+            self.l.mark(cid, "REJECTED")
+            return {"mode": "live", "status": "REJECTED"}
         for key in ["quantity", "amount"]:
             if key not in detail:
                 raise UnresolvedOrder("Final order lacks fill accounting")
         quantity = D(detail["quantity"])
         amount = D(detail["amount"])
         if quantity == 0:
-            # No documented status enum distinguishes cancelled/rejected/
-            # never-filled; zero quantity is the only unambiguous "no trade"
-            # signal available.
             self.l.mark(cid, "REJECTED")
             return {"mode": "live", "status": "REJECTED"}
         if quantity > D(p["base_size"]):

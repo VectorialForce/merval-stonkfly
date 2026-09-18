@@ -212,7 +212,9 @@ class FakePPIClient:
             "id": oid,
             "externalID": kw["externalID"],
             "ticker": kw["ticker"],
-            "operation": kw["operation"],
+            # Real PPI Detail responses report this upper case ("COMPRA"/
+            # "VENTA") regardless of the title-case value submitted.
+            "operation": kw["operation"].upper(),
             "quantity": str(quantity),
             "amount": str(amount),
             "active": self.stuck_orders,
