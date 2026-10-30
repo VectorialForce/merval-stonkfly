@@ -223,6 +223,13 @@ class MemoryBrain(NativeBrain):
             or not math.isfinite(lamina_bias)
         ):
             raise ValueError("Invalid interval/current")
+        if self.sensory_noise_std:
+            # Photon shot noise at phototransduction, not a perturbation of
+            # the decision itself: this is upstream of the retained
+            # connectome's propagation/decoding, which stays exactly as
+            # validated. input_sha256 (controller.py) still fingerprints the
+            # true observed market image, unaffected by this.
+            light = light + self.rng.normal(0, self.sensory_noise_std, light.shape)
         self.luminance += (1 - math.exp(-steps * self.dt / 10)) * (
             np.clip(light, 0, 1) - self.luminance
         )

@@ -15,14 +15,14 @@ class Guard:
         self.l = ledger
         self.stop_file = stop_file
 
-    def check(self, quotes, now):
+    def check(self, quotes, now, required):
         if self.stop_file.exists():
             raise Veto("STOP file present")
         if self.l.get("halted"):
             raise Veto(self.l.get("halted"))
         if self.l.pending():
             raise Veto("Order outcome unresolved")
-        if set(quotes) != set(self.s.products):
+        if set(quotes) != set(required):
             raise Veto("Incomplete market snapshot")
         for product, q in quotes.items():
             if q.product != product:
@@ -37,7 +37,7 @@ class Guard:
 
     def plan(self, product, side, quotes, now=None):
         now = time.time() if now is None else now
-        self.check(quotes, now)
+        self.check(quotes, now, {product} | set(self.l.positions))
         if product not in self.s.products or side not in ("BUY", "SELL"):
             raise Veto("Invalid neural proposal")
         if now - self.l.get("last_attempt") < self.s.interval_seconds:

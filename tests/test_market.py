@@ -40,11 +40,11 @@ def test_completed_history_and_observation_clock():
     ]
     client._book["date"] = iso(now)
     m = PPIMarket((GGAL,), client)
-    quotes = m.snapshot()
+    quotes = m.snapshot(["GGAL"])
     assert m.history["GGAL"] == [101.0, 99.0]
     m.record(quotes)
     assert m.history["GGAL"] == [101.0, 99.0, 100.05]
-    m.snapshot()  # Execution quote refresh must not add another neural observation.
+    m.snapshot(["GGAL"])  # Execution quote refresh must not add another neural observation.
     assert len(m.history["GGAL"]) == 3
     q = quotes["GGAL"]
     frame = market_frame(q.product, m.history[q.product], q.bid, q.ask)
@@ -60,7 +60,7 @@ def test_empty_book_falls_back_to_current_price():
     client._book = {"date": None, "bids": [], "offers": []}
     client._current = {"date": iso(now), "price": "150"}
     m = PPIMarket((GGAL,), client)
-    q = m.snapshot()["GGAL"]
+    q = m.snapshot(["GGAL"])["GGAL"]
     assert q.bid == q.ask == D("150")
     assert q.timestamp == pytest.approx(now.timestamp())
 
@@ -73,15 +73,18 @@ def test_no_book_and_no_current_is_a_hard_error():
     client._current = {}
     m = PPIMarket((GGAL,), client)
     with pytest.raises(RuntimeError):
-        m.snapshot()
+        m.snapshot(["GGAL"])
 
 
-def test_no_historical_bars_is_a_hard_error():
+def test_no_historical_bars_bootstraps_from_current_quote():
+    # A thinly traded Panel General ticker can go hours without a trade;
+    # that's expected, not a reason to crash the whole worker (confirmed
+    # against real BYMA data with --products ALL).
     client = FakePPIClient()
     client.bars = []
     m = PPIMarket((GGAL,), client)
-    with pytest.raises(RuntimeError):
-        m.snapshot()
+    q = m.snapshot(["GGAL"])["GGAL"]
+    assert m.history["GGAL"] == [float((q.bid + q.ask) / 2)]
 
 
 def test_explicit_timestamp_zone():

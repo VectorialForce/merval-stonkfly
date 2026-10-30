@@ -6,16 +6,16 @@ keeping the same bounded-risk shape the Guard's cooldown model assumes for
 crypto FOK orders. Intent is persisted before the request. An ambiguous result
 is never retried as a new order.
 
-Known documentation gaps that make PPIBroker best-effort, not verified:
-PPI's Order/Detail schema exposes only a single "quantity"/"amount" pair with
-no distinct filled-vs-requested field and no documented status enum, so a
-terminal order is inferred from its absence in Order/ActiveOrders rather than
-from a status string. There is also no commission field on Order/Detail, so
-fills are booked with zero fee; a real PPI account will charge a commission
-that this ledger will not see, and verify_balances() is expected to trip on
-the resulting mismatch. Both gaps must be resolved against real sandbox
-responses (Account/Movements is the natural cross-check) before --live is
-ever used.
+Known documentation gaps, confirmed against real live orders:
+PPI's Order/Detail "quantity"/"amount" reflect the originally *requested*
+size even when nothing filled, not a filled-vs-requested split, so a
+cancelled/rejected order is identified by its "status" field ("CANCELADA"
+confirmed; "RECHAZADA" inferred, unconfirmed) rather than by quantity==0.
+There is also no commission field on Order/Detail, so a real fill's true fee
+is recovered empirically, from the gap between the account's real cash and
+what the ledger would expect assuming zero fee (see _observed_fee) — the
+existing fee_ceiling check still halts further orders if that gap is ever
+larger than what was reserved for the trade.
 """
 
 import os
@@ -24,7 +24,7 @@ import time
 from .config import D
 from .risk import Veto
 
-TERMINAL_WAIT_SECONDS = 30
+TERMINAL_WAIT_SECONDS = 120
 
 
 class UnresolvedOrder(RuntimeError):
@@ -119,10 +119,17 @@ class PPIBroker:
         for group in data.get("groupedInstruments", []):
             for item in group.get("instruments", []):
                 ticker = item.get("ticker")
-                amount = D(item.get("amount", 0))
-                if amount < 0:
+                # Confirmed against a real held position: "amount" here is
+                # the position's market VALUE (price * quantity, e.g. 6690
+                # for 1 GGAL share), not a share count — unlike
+                # groupedAvailability's "amount", which really is a plain
+                # cash amount. self.l.positions is a share count, so this
+                # must read "quantity" or every held position permanently
+                # mismatches (6690 vs 1) the moment it's actually held.
+                quantity = D(item.get("quantity", 0))
+                if quantity < 0:
                     raise RuntimeError("Negative external holding")
-                result[ticker] = result.get(ticker, D(0)) + amount
+                result[ticker] = result.get(ticker, D(0)) + quantity
         return result
 
     def preflight(self):
@@ -284,8 +291,29 @@ class PPIBroker:
             raise UnresolvedOrder("Buy fill exceeded limit price")
         if p["side"] == "SELL" and amount + D(".01") < limit * quantity:
             raise UnresolvedOrder("Sell fill below limit price")
-        self.l.settle(cid, quantity, amount, D(0))
+        self.l.settle(cid, quantity, amount, self._observed_fee(p, amount))
         return {"mode": "live", "status": "SETTLED", "client_order_id": cid}
+
+    def _observed_fee(self, plan, amount):
+        # Confirmed against a real fill: PPI charged a real commission this
+        # ledger has no field to read (Order/Detail has none, see module
+        # docstring), producing exactly the cash mismatch verify_balances()
+        # was already designed to catch. The only way to recover the true
+        # fee is empirically: compare this trade's notional against how much
+        # the real account's cash actually moved since the ledger's own
+        # pre-trade balance (there is at most one order in flight at a time,
+        # so no other settlement can have touched it in between). A
+        # non-positive result (cash moved by no more than the notional
+        # itself) is treated as no discoverable fee rather than a rebate,
+        # since Ledger.settle() rejects a negative fee outright; the
+        # existing fee_ceiling check in Ledger.settle() still halts further
+        # orders if this ever comes back larger than what was reserved.
+        real_ars = self.balances().get("ARS", D(0))
+        if plan["side"] == "BUY":
+            implied = (self.l.cash - amount) - real_ars
+        else:
+            implied = amount - (real_ars - self.l.cash)
+        return implied if implied > 0 else D(0)
 
     def reconcile(self):
         for row in self.l.pending():

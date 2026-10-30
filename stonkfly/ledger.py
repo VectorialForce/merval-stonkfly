@@ -3,6 +3,7 @@
 import contextlib
 import json
 import sqlite3
+import sys
 import uuid
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from .config import D
 
 
 class Ledger:
-    def __init__(self, path, settings, mode):
+    def __init__(self, path, settings, mode, accept_settings_change=False):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, isolation_level=None)
@@ -32,15 +33,30 @@ class Ledger:
                     "positions": {},
                     "anchor": settings.capital,
                     "tick": 0,
+                    "cursor": 0,
                     "checkpoint": None,
                     "halted": None,
                     "last_attempt": 0,
                 }.items():
                     self.put(k, v)
-        elif self.get("settings") != settings.signature() or self.get("mode") != mode:
+        elif self.get("mode") != mode:
+            # paper/live is a fundamental identity, never crossed silently.
             raise RuntimeError(
-                "Run settings/mode mismatch; use a separate paper run directory"
+                "Run mode mismatch; use a separate run directory"
             )
+        elif self.get("settings") != settings.signature():
+            if not accept_settings_change:
+                raise RuntimeError(
+                    "Settings changed since this run directory was initialized; use a "
+                    "separate run directory, or review the change and pass --accept-migration"
+                )
+            print(
+                f"--accept-migration: settings {self.get('settings')[:12]} -> "
+                f"{settings.signature()[:12]}",
+                file=sys.stderr,
+            )
+            with self.transaction():
+                self.put("settings", settings.signature())
 
     @contextlib.contextmanager
     def transaction(self):

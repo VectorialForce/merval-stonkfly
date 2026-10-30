@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 from dataclasses import asdict, dataclass
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from pathlib import Path
@@ -15,22 +16,23 @@ class Instrument:
     market: str = "BYMA"
 
 
-# Small built-in default: a mix of acciones lideres and CEDEARs, mirroring the
-# spirit of the previous 3-pair USDC crypto allowlist. Settlement/tick-size
-# conventions are not published by PPI's docs; INMEDIATA (CI) is the simplest,
-# most liquid default and should be reconciled against Configuration/Settlements
-# and SearchInstrument before any live use.
-_DEFAULT_INSTRUMENTS = [
-    Instrument("GGAL", "ACCIONES"),
-    Instrument("YPFD", "ACCIONES"),  # YPF's peso-settlement ticker; PPI has no bare "YPF"
-    Instrument("PAMP", "ACCIONES"),
-    Instrument("AAPL", "CEDEARS"),
-    Instrument("KO", "CEDEARS"),
-]
+# Hard cap on what the bot may ever trade: the S&P MERVAL panel (acciones
+# lideres). Everything else -- the built-in default, the refreshed cache and
+# `--products ALL` -- is filtered down to this set, so a fresh
+# `instruments --refresh` can never widen it. Settlement/tick-size conventions
+# are not published by PPI's docs; INMEDIATA (CI) is the simplest, most liquid
+# default and should be reconciled against Configuration/Settlements and
+# SearchInstrument before any live use.
+MERVAL_PANEL = (
+    "ALUA", "BBAR", "BMA", "BYMA", "CEPU", "COME", "CRES", "ECOG", "EDN", "GGAL",
+    "LOMA", "METR", "PAMP", "SUPV", "TGNO4", "TGSU2", "TRAN", "TXAR", "VALO",
+    "YPFD",  # YPF's peso-settlement ticker; PPI has no bare "YPF"
+)
+_DEFAULT_INSTRUMENTS = [Instrument(t, "ACCIONES") for t in MERVAL_PANEL]
 
-# `stonkfly instruments --refresh` fetches the full BYMA ACCIONES panel via
-# PPI's SearchInstrument endpoint and caches it here, replacing the small
-# built-in default above with every listed stock. Kept outside the package
+# `stonkfly instruments --refresh` fetches BYMA ACCIONES listings via PPI's
+# SearchInstrument endpoint and caches the MERVAL_PANEL tickers with a live
+# market here, replacing the built-in default above. Kept outside the package
 # (alongside the other fetched/verified datasets in data/) rather than in the
 # neural dataset's own sources.lock.json family, since this is a live listing
 # that changes over time, not a hash-verified fixed dataset.
@@ -40,9 +42,13 @@ _CACHE_PATH = Path(__file__).resolve().parent.parent / "data" / "instruments.jso
 def _load_instruments():
     if _CACHE_PATH.exists():
         rows = json.loads(_CACHE_PATH.read_text())
-        instruments = [Instrument(**row) for row in rows]
+        instruments = [
+            Instrument(**row) for row in rows if row["ticker"] in MERVAL_PANEL
+        ]
         if not instruments:
-            raise RuntimeError(f"{_CACHE_PATH} is empty; delete it or refresh it")
+            raise RuntimeError(
+                f"{_CACHE_PATH} has no MERVAL panel tickers; delete it or refresh it"
+            )
         return instruments
     return list(_DEFAULT_INSTRUMENTS)
 
@@ -53,8 +59,24 @@ INSTRUMENTS = {i.ticker: i for i in _load_instruments()}
 _SWEEP_TERMS = "abcdefghijklmnopqrstuvwxyz0123456789"
 
 
+def _has_live_market(client, instrument):
+    try:
+        book = client.book(instrument.ticker, instrument.instrument_type, instrument.settlement)
+    except Exception:
+        book = {}
+    if (book.get("bids") or []) and (book.get("offers") or []):
+        return True
+    try:
+        current = client.current(
+            instrument.ticker, instrument.instrument_type, instrument.settlement
+        )
+    except Exception:
+        current = {}
+    return bool(current.get("price") and current.get("date"))
+
+
 def refresh_instruments(env=None):
-    """Fetch every BYMA ACCIONES listing via PPI SearchInstrument and cache it.
+    """Fetch the MERVAL panel's BYMA ACCIONES listings via PPI SearchInstrument and cache them.
 
     SearchInstrument is a substring search, not a listing endpoint: PPI
     rejects a blank ticker/name ("Field 'Ticker' is required"), so there is
@@ -75,10 +97,27 @@ def refresh_instruments(env=None):
                 raise RuntimeError(f"SearchInstrument row has no ticker field: {row}")
             if row.get("type") != "ACCIONES" or row.get("market") != "BYMA":
                 continue
+            if ticker not in MERVAL_PANEL:
+                continue
             seen[ticker] = Instrument(ticker, "ACCIONES", market="BYMA")
     if not seen:
-        raise RuntimeError("PPI SearchInstrument returned no BYMA ACCIONES instruments")
+        raise RuntimeError("PPI SearchInstrument returned no MERVAL panel instruments")
     ordered = sorted(seen.values(), key=lambda i: i.ticker)
+    # SearchInstrument lists every ticker BYMA ever registered, including
+    # ones with no live market at all (suspended/delisted names, confirmed
+    # against a real one: no book AND no current price, ever) — PPIMarket
+    # requires every configured product to have a fresh quote every tick, so
+    # a single such ticker would make the whole worker skip forever. Probe
+    # each ticker once here rather than discovering this live.
+    live = []
+    for n, i in enumerate(ordered, 1):
+        print(f"\rprobing {n}/{len(ordered)}: {i.ticker}    ", end="", file=sys.stderr)
+        if _has_live_market(client, i):
+            live.append(i)
+    print(file=sys.stderr)
+    if not live:
+        raise RuntimeError("None of the fetched BYMA instruments have live market data")
+    ordered = live
     _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     _CACHE_PATH.write_text(json.dumps([asdict(i) for i in ordered], indent=2) + "\n")
     global INSTRUMENTS
@@ -114,7 +153,7 @@ class Settings:
     spread_limit: str = "0.005"
     daily_orders: int = 24
     interval_seconds: float = 60
-    max_quote_age: float = 15
+    max_quote_age: float = 30
     neural_ms: float = 500
     neural_bin_ms: float = 10
     pulse_ms: float = 200
@@ -123,6 +162,7 @@ class Settings:
     decoder_threshold_hz: float = 2
     paper_fee: str = "0.006"
     learning: bool = True
+    sensory_noise_std: float = 0.0
 
     def __post_init__(self):
         if (
@@ -164,6 +204,8 @@ class Settings:
         ]:
             if not math.isfinite(x) or x <= 0:
                 raise ValueError("Positive finite parameter required")
+        if not math.isfinite(self.sensory_noise_std) or not 0 <= self.sensory_noise_std <= 1:
+            raise ValueError("sensory_noise_std must be in [0, 1] (luminance units)")
         if self.neural_bin_ms > 10 or self.pulse_ms > self.neural_ms:
             raise ValueError(
                 "Use <=10 ms neural bins; pulse must fit a decision window"

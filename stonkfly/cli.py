@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import random
 import sys
 import time
 import traceback
@@ -26,8 +27,10 @@ def main():
     instruments_cmd.add_argument(
         "--refresh",
         action="store_true",
-        help="Fetch every BYMA ACCIONES listing via PPI SearchInstrument and cache it "
-        "in data/instruments.json; requires .env PPI credentials",
+        help="Fetch the MERVAL panel's BYMA ACCIONES listings via PPI SearchInstrument, probe each "
+        "for a live book/current price, and cache the ones that have one in "
+        "data/instruments.json; requires .env PPI credentials. Run this during BYMA "
+        "market hours, or every ticker looks dead and the result is empty.",
     )
     run = sub.add_parser("run")
     run.add_argument("--live", action="store_true")
@@ -40,6 +43,12 @@ def main():
         "--resume-reviewed",
         action="store_true",
         help="After manual review, clear a transient halt only after successful reconciliation",
+    )
+    run.add_argument(
+        "--accept-migration",
+        action="store_true",
+        help="After reviewing what changed in stonkfly's source since this run directory's "
+        "last provenance was recorded, keep using it instead of requiring a fresh directory",
     )
     run.add_argument(
         "--debug",
@@ -78,6 +87,14 @@ def main():
         "in the current allowlist (see `stonkfly instruments`)",
     )
     run.add_argument("--neural-ms", type=float, default=500)
+    run.add_argument(
+        "--sensory-noise-std",
+        type=float,
+        default=0.0,
+        help="Gaussian phototransduction noise std, in [0,1] luminance units "
+        "(0 = off, current exact behavior). Upstream of the retained connectome's "
+        "propagation/decoding, which this never touches.",
+    )
     status = sub.add_parser("status")
     status.add_argument("--out", type=Path, default=Path("runs/paper"))
     a = p.parse_args()
@@ -137,6 +154,7 @@ def main():
         learning=not a.frozen,
         neural_ms=a.neural_ms,
         pulse_ms=min(200, a.neural_ms),
+        sensory_noise_std=a.sensory_noise_std,
     )
     out = a.out or Path("runs/live" if a.live else "runs/paper")
     out.mkdir(parents=True, exist_ok=True)
@@ -148,7 +166,12 @@ def main():
     from .broker import PaperBroker, PPIBroker
     from .ledger import Ledger
 
-    ledger = Ledger(out / "ledger.sqlite", settings, "live" if a.live else "paper")
+    ledger = Ledger(
+        out / "ledger.sqlite",
+        settings,
+        "live" if a.live else "paper",
+        accept_settings_change=a.accept_migration,
+    )
     try:
         broker = (
             PPIBroker.from_env(settings, ledger)
@@ -181,19 +204,33 @@ def main():
         from .risk import Guard, Veto
 
         instruments = [settings.instrument(t) for t in settings.products]
-        if a.live:
-            market = PPIMarket(instruments, broker.client)
-        elif a.real_data:
+        if a.live or a.real_data:
             # Imported here, not at module load: a plain fixture/paper run
             # must never require httpx or any PPI-specific code.
-            from .ppi import PPIClient
+            from .ppi import PPIError
 
-            market = PPIMarket(instruments, PPIClient.from_env(os.environ))
+            if a.live:
+                market = PPIMarket(instruments, broker.client)
+            else:
+                from .ppi import PPIClient
+
+                market = PPIMarket(instruments, PPIClient.from_env(os.environ))
         else:
             market = FixtureMarket(instruments)
+
+            class PPIError(Exception):
+                pass
         previous = ledger.get("observation")
         if previous:
-            market.history = previous["market_history"]
+            # Merge, don't replace: __init__ already seeded every *current*
+            # product with an empty history. A prior run tracking fewer
+            # products (e.g. switching from GGAL-only to --products ALL)
+            # has no saved history for the newly added tickers, and
+            # overwriting wholesale would drop their empty-list entries,
+            # crashing snapshot()'s history lookup for anything new.
+            for ticker, hist in previous["market_history"].items():
+                if ticker in market.history:
+                    market.history[ticker] = hist
             if isinstance(market, FixtureMarket):
                 market.tick = previous["fixture_tick"]
         controller = FlyController(settings)
@@ -225,9 +262,16 @@ def main():
         signature = hashlib.sha256(
             json.dumps(provenance, sort_keys=True).encode()
         ).hexdigest()
-        if ledger.get("provenance_sha256") not in (None, signature):
-            raise RuntimeError(
-                "Run source/protocol changed; use a separate paper run or explicitly review migration"
+        stored_signature = ledger.get("provenance_sha256")
+        if stored_signature not in (None, signature):
+            if not a.accept_migration:
+                raise RuntimeError(
+                    "Run source/protocol changed; use a separate paper run, or review what "
+                    "changed and pass --accept-migration to keep this run directory"
+                )
+            print(
+                f"--accept-migration: provenance {stored_signature[:12]} -> {signature[:12]}",
+                file=sys.stderr,
             )
         ledger.put("provenance_sha256", signature)
         (out / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
@@ -240,10 +284,38 @@ def main():
                 break
             broker.reconcile()
             broker.verify_balances()
-            quotes = market.snapshot()
-            guard.check(quotes, time.time())
+            # Pick at random on every attempt, not just committed ticks:
+            # `tick` only advances past guard.check()'s skip-and-continue
+            # path, so a fixed rotation keyed off it would wedge on a single
+            # chronically stale/illiquid ticker forever with a large uneven
+            # universe (--products ALL). `cursor` is now just an attempt
+            # counter for telemetry, not a selection index.
+            cursor = (ledger.get("cursor") or 0) + 1
+            ledger.put("cursor", cursor)
+            product = random.choice(settings.products)
+            needed = {product} | set(ledger.positions)
+            try:
+                quotes = market.snapshot(needed)
+                guard.check(quotes, time.time(), needed)
+            except (Veto, PPIError, RuntimeError) as e:
+                # A transient rejection of this tick's snapshot (stale quote,
+                # wide spread, ...) or a transient market-data fetch failure
+                # (PPI network hiccup, empty/malformed response, no live
+                # data for this ticker right now — all confirmed against
+                # real BYMA data), not a proposed trade: skip this attempt
+                # and retry next cycle, exactly like an execution veto below,
+                # rather than stopping the worker. The one exception is a
+                # genuine account-level stop (e.g. loss stop), which sets
+                # `halted` itself before raising; that must still stop us.
+                print(json.dumps({"tick": ledger.get("tick"), "skipped": str(e)}), flush=True)
+                if ledger.get("halted"):
+                    break
+                if not a.fast:
+                    until = started + settings.interval_seconds
+                    while time.monotonic() < until and not (out / "STOP").exists():
+                        time.sleep(min(1, until - time.monotonic()))
+                continue
             market.record(quotes)
-            product = settings.products[ledger.get("tick") % len(settings.products)]
             q = quotes[product]
             equity = ledger.equity(quotes)
             kind, delta = reinforcement(
@@ -272,15 +344,28 @@ def main():
             order = {"status": "HOLD"}
             if neural["side"] != "HOLD":
                 try:
-                    # Neural integration can be slow; use a fresh execution book.
-                    fresh = market.snapshot()
-                    latest = fresh[product]
-                    if abs(latest.bid - q.bid) / q.bid > D(settings.slippage):
-                        raise Veto("Price moved beyond neural observation tolerance")
-                    provider.quotes = fresh
-                    order = provider.invoke({"product": product, "side": neural["side"]})
-                except Veto as e:
+                    # Neural integration can be slow; use a fresh execution
+                    # book. A transient market-data failure here (same
+                    # causes as the top-of-loop fetch) means only that this
+                    # tick's trade is abandoned — nothing has been submitted
+                    # yet, so it's as safe to treat as a plain Veto. Once
+                    # provider.invoke() is reached, a real order may be in
+                    # flight; a bare RuntimeError from there (e.g. a
+                    # ledger.settle() consistency check) must NOT be caught
+                    # here as if it were a routine skip.
+                    fresh = market.snapshot(needed)
+                except (PPIError, RuntimeError) as e:
                     order = {"status": "VETO", "reason": str(e)}
+                    fresh = None
+                if fresh is not None:
+                    try:
+                        latest = fresh[product]
+                        if abs(latest.bid - q.bid) / q.bid > D(settings.slippage):
+                            raise Veto("Price moved beyond neural observation tolerance")
+                        provider.quotes = fresh
+                        order = provider.invoke({"product": product, "side": neural["side"]})
+                    except Veto as e:
+                        order = {"status": "VETO", "reason": str(e)}
             row = {
                 "tick": ledger.get("tick"),
                 "wall_time": time.time(),

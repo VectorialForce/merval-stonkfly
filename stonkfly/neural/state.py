@@ -73,6 +73,14 @@ class Brain:
         self.nactive = np.asarray([len(initial)], dtype=np.int32)
         self.total_spikes = 0
         self.sim_ms = 0
+        # Fresh OS entropy each process start, not checkpointed: phototransduction
+        # noise (see sensory_noise_std) is meant to vary run to run, and the
+        # checkpoint format is deliberately allow_pickle=False, numeric-array-only
+        # (see checkpoint()/restore()) for integrity auditing, which a generator's
+        # internal state doesn't fit cleanly. A resumed run gets a new noise
+        # stream rather than continuing the old one.
+        self.rng = np.random.default_rng()
+        self.sensory_noise_std = 0.0
 
 
 class NativeBrain(Brain):

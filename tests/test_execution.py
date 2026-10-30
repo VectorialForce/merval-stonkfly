@@ -53,6 +53,8 @@ def test_nonfinite_money(value):
         dict(reward_deadband="0"),
         dict(interval_seconds=float("nan")),
         dict(daily_orders=1.5),
+        dict(products=("AAPL",)),
+        dict(products=("GGAL", "KO")),
     ],
 )
 def test_configuration_bounds(changes):
@@ -95,7 +97,7 @@ def test_stop_loss_and_external_stop(env):
     g.stop_file.unlink()
     l.put("cash", "79000")
     with pytest.raises(Veto):
-        g.check({"GGAL": quote()}, time.time())
+        g.check({"GGAL": quote()}, time.time(), {"GGAL"})
     assert "Loss stop" in l.get("halted")
 
 
@@ -160,6 +162,7 @@ class FakePPIClient:
 
     def __init__(self):
         self.cash = D(100000)
+        self.real_fee = D(0)
         self.ggal = D(0)
         self.orders = {}
         self.next_id = 1
@@ -181,7 +184,15 @@ class FakePPIClient:
                 }
             ],
             "groupedInstruments": [
-                {"name": "Acciones", "instruments": [{"ticker": "GGAL", "price": "0", "amount": str(self.ggal)}]}
+                {
+                    "name": "Acciones",
+                    # Real PPI: "quantity" is the share count, "amount" is
+                    # market value (price * quantity) — code must read
+                    # "quantity" against self.l.positions' share counts.
+                    "instruments": [
+                        {"ticker": "GGAL", "price": "0", "quantity": str(self.ggal), "amount": "0"}
+                    ],
+                }
             ],
         }
 
@@ -206,8 +217,13 @@ class FakePPIClient:
         self.next_id += 1
         quantity = D(kw["quantity"])
         amount = quantity * D(str(kw["price"]))
-        self.cash -= amount
-        self.ggal += quantity
+        # A real commission PPI charges on the account but never reports
+        # back through Order/Detail's "amount" field (see broker.py).
+        if kw["operation"] == "Compra":
+            self.cash -= amount + self.real_fee
+        else:
+            self.cash += amount - self.real_fee
+        self.ggal += quantity if kw["operation"] == "Compra" else -quantity
         self.orders[oid] = {
             "id": oid,
             "externalID": kw["externalID"],
@@ -262,6 +278,30 @@ def test_ppi_day_limit_fill_and_reconciled_balances(env):
     broker.verify_balances()
 
 
+def test_real_commission_is_derived_from_balance_not_assumed_zero(env):
+    # PPI's Order/Detail has no commission field (see broker.py), so a real
+    # fee only shows up as a gap between the account's real cash and what
+    # the ledger would expect if it assumed zero fee. Confirmed against a
+    # real live fill during development: the fee must be recovered from that
+    # gap, or verify_balances() halts on every single future trade forever.
+    client, broker, p = live_double(env)
+    client.real_fee = D("17.61")
+    result = p.invoke({"product": "GGAL", "side": "BUY"})
+    assert result["status"] == "SETTLED"
+    l = env[1]
+    assert l.cash == client.cash
+    broker.verify_balances()  # must not raise: fee was captured, not assumed zero
+
+
+def test_fee_exceeding_ceiling_halts_further_orders(env):
+    client, broker, p = live_double(env)
+    client.real_fee = D("500")  # far beyond this order's reserved fee_ceiling (~195)
+    result = p.invoke({"product": "GGAL", "side": "BUY"})
+    assert result["status"] == "SETTLED"
+    l = env[1]
+    assert "fee exceeded" in l.get("halted")
+
+
 @pytest.mark.parametrize("failure", ["budget_rejected", "stop", "stale"])
 def test_preview_cannot_bypass_final_guard(env, failure):
     client, broker, p = live_double(env)
@@ -270,7 +310,7 @@ def test_preview_cannot_bypass_final_guard(env, failure):
     if failure == "stop":
         client.after_budget = env[2].stop_file.touch
     if failure == "stale":
-        p.quotes = {"GGAL": quote(timestamp=time.time() - 20)}
+        p.quotes = {"GGAL": quote(timestamp=time.time() - 40)}
     with pytest.raises(Veto):
         p.invoke({"product": "GGAL", "side": "BUY"})
     assert client.submissions == 0

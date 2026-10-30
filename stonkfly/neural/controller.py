@@ -51,6 +51,7 @@ class FlyController:
         self.s = settings
         self.brain = VisualMemoryBrain()
         self.brain.weights_frozen = not settings.learning
+        self.brain.sensory_noise_std = settings.sensory_noise_std
         self.decoder = Decoder(
             self.brain.ids, annotations(self.brain.ids), settings.decoder_threshold_hz
         )

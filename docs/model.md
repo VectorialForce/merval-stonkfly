@@ -22,7 +22,9 @@ PPI historical bars (`MarketData/Search`) initialize the price history. Subseque
 
 Existing R8→aMe12 connections use a net excitatory sign motivated by [Xiao et al., 2023](https://doi.org/10.1038/s41586-023-06681-6); transferring that result to these reconstructed cells and contact-count magnitudes remains an assumption. The initial dark chart barely activated KCs in our probe. We changed the chart to a light background, without changing neural currents or fitting to trading returns. Display sensitivity is a major confound to test.
 
-By default each market observation advances **500 ms of neural time**, regardless of elapsed wall time. Wall observations are at least 60 seconds apart. That is a deliberately compressed market-to-neural clock, not real-time fly physiology. Eligibility and decay operate in neural seconds. Multiple optional assets are presented in a fixed round-robin schedule; the network does not choose which asset is shown.
+By default each market observation advances **500 ms of neural time**, regardless of elapsed wall time. Wall observations are at least 60 seconds apart. That is a deliberately compressed market-to-neural clock, not real-time fly physiology. Eligibility and decay operate in neural seconds. With multiple optional assets configured, one is chosen uniformly at random each attempt (not a fixed round-robin: with a large, uneven asset list some tickers go stale/illiquid long enough that a fixed rotation can wedge on the same one indefinitely); the network still does not choose which asset is shown.
+
+`--sensory-noise-std` (default 0, exact prior behavior) adds Gaussian noise at the photoreceptor transduction step, upstream of the retained connectome's propagation/decoding — a shot-noise proxy, not a perturbation of the decoder's output. It reseeds from OS entropy on every process start rather than being checkpointed, so it is not reproducible across a restart.
 
 ## How a neural spike becomes an order
 

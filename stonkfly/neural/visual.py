@@ -133,6 +133,14 @@ class VisualMemoryBrain(MemoryBrain):
         values = np.where(
             values <= 0.04045, values / 12.92, ((values + 0.055) / 1.055) ** 2.4
         )
+        if self.sensory_noise_std:
+            # Same phototransduction noise as the brightness channel
+            # (brain.py's _neural_step); R8 is a separate photoreceptor
+            # population so it needs its own noise draw, clipped since
+            # unlike _neural_step this value isn't clipped downstream.
+            values = np.clip(
+                values + self.rng.normal(0, self.sensory_noise_std, values.shape), 0, 1
+            )
         self.r8_light += (
             1 - math.exp(-round(duration_ms / self.dt) * self.dt / 10)
         ) * (values - self.r8_light)
