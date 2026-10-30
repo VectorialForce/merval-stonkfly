@@ -16,8 +16,8 @@ class Instrument:
     market: str = "BYMA"
 
 
-# Hard cap on what the bot may ever trade: the S&P MERVAL panel (acciones
-# lideres). Everything else -- the built-in default, the refreshed cache and
+# Hard cap on what the bot may ever trade: the operator's chosen panel (the
+# broker screen's list plus COME). Everything else -- the built-in default, the refreshed cache and
 # `--products ALL` -- is filtered down to this set, so a fresh
 # `instruments --refresh` can never widen it. Settlement/tick-size conventions
 # are not published by PPI's docs; INMEDIATA (CI) is the simplest, most liquid
