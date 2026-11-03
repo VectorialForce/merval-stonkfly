@@ -15,6 +15,24 @@ from pathlib import Path
 from .config import D, INSTRUMENTS, Settings
 
 
+def _account_check(broker, ledger, transient):
+    """Reconcile and verify balances; return why this attempt must be skipped.
+
+    A failed read (network drop, empty PPI response, both seen live) proves
+    nothing about the account while no order is pending, so it retries next
+    cycle. With a pending order the outcome is unknown and execution stops.
+    Balance mismatches are not `transient` and always stop.
+    """
+    try:
+        broker.reconcile()
+        broker.verify_balances()
+    except transient as e:
+        if ledger.pending():
+            raise
+        return str(e)
+    return None
+
+
 def main():
     p = argparse.ArgumentParser(prog="stonkfly")
     sub = p.add_subparsers(dest="command", required=True)
@@ -49,6 +67,13 @@ def main():
         action="store_true",
         help="After reviewing what changed in stonkfly's source since this run directory's "
         "last provenance was recorded, keep using it instead of requiring a fresh directory",
+    )
+    run.add_argument(
+        "--adopt-balances",
+        action="store_true",
+        help="Live only, on a fresh run directory: start from the account's current "
+        "ARS and holdings (all must be in --products) instead of requiring an "
+        "ARS-only account. Holdings are valued at the current bid as the baseline",
     )
     run.add_argument(
         "--debug",
@@ -144,6 +169,8 @@ def main():
         return
     if a.live and (a.fixture or a.fast or a.real_data):
         p.error("Live mode forbids fixtures, fast replay and --real-data")
+    if a.adopt_balances and not a.live:
+        p.error("--adopt-balances requires --live")
     if a.real_data and a.fixture:
         p.error("--real-data and --fixture are mutually exclusive")
     if a.steps < 0:
@@ -178,7 +205,14 @@ def main():
             if a.live
             else PaperBroker(settings, ledger)
         )
-        result = broker.preflight()
+        if a.adopt_balances:
+            from .market import PPIMarket
+
+            result = broker.preflight(
+                PPIMarket([settings.instrument(t) for t in settings.products], broker.client)
+            )
+        else:
+            result = broker.preflight()
         print(json.dumps(result), flush=True)
         if a.resume_reviewed:
             if (out / "STOP").exists() or ledger.pending():
@@ -278,12 +312,22 @@ def main():
         guard = Guard(settings, ledger, out / "STOP")
         provider = StonkflyActions(guard, broker)
         count = 0
+
+        def wait(started):
+            if not a.fast:
+                until = started + settings.interval_seconds
+                while time.monotonic() < until and not (out / "STOP").exists():
+                    time.sleep(min(1, until - time.monotonic()))
+
         while not a.steps or count < a.steps:
             started = time.monotonic()
             if (out / "STOP").exists() or ledger.get("halted"):
                 break
-            broker.reconcile()
-            broker.verify_balances()
+            skipped = _account_check(broker, ledger, PPIError)
+            if skipped:
+                print(json.dumps({"tick": ledger.get("tick"), "skipped": skipped}), flush=True)
+                wait(started)
+                continue
             # Pick at random on every attempt, not just committed ticks:
             # `tick` only advances past guard.check()'s skip-and-continue
             # path, so a fixed rotation keyed off it would wedge on a single
@@ -310,10 +354,7 @@ def main():
                 print(json.dumps({"tick": ledger.get("tick"), "skipped": str(e)}), flush=True)
                 if ledger.get("halted"):
                     break
-                if not a.fast:
-                    until = started + settings.interval_seconds
-                    while time.monotonic() < until and not (out / "STOP").exists():
-                        time.sleep(min(1, until - time.monotonic()))
+                wait(started)
                 continue
             market.record(quotes)
             q = quotes[product]

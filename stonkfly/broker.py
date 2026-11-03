@@ -112,10 +112,12 @@ class PPIBroker:
         for group in data.get("groupedAvailability", []):
             for item in group.get("availability", []):
                 symbol = item.get("symbol")
-                amount = D(item.get("amount", 0))
-                if amount < 0:
-                    raise RuntimeError("Negative external balance")
-                result[symbol] = result.get(symbol, D(0)) + amount
+                # One settlement term can be negative while a purchase awaits
+                # settlement (real A-24HS debit covered by INMEDIATA cash), so
+                # only the net per symbol, checked below, means an overdraft.
+                result[symbol] = result.get(symbol, D(0)) + D(item.get("amount", 0))
+        if any(amount < 0 for amount in result.values()):
+            raise RuntimeError("Negative external balance")
         for group in data.get("groupedInstruments", []):
             for item in group.get("instruments", []):
                 ticker = item.get("ticker")
@@ -132,9 +134,15 @@ class PPIBroker:
                 result[ticker] = result.get(ticker, D(0)) + quantity
         return result
 
-    def preflight(self):
+    def preflight(self, adopt_market=None):
+        """With `adopt_market`, a fresh ledger starts from the account's real
+        cash and holdings instead of requiring an ARS-only account."""
         self.reconcile()
         balances = self.balances()
+        if adopt_market is not None and self.l.get("live_initialized"):
+            raise RuntimeError(
+                "--adopt-balances only initializes a fresh run directory; this one is in use"
+            )
         if not self.l.get("live_initialized"):
             if (
                 self.l.get("tick")
@@ -142,25 +150,53 @@ class PPIBroker:
             ):
                 raise RuntimeError("Uninitialized live ledger already has activity")
             other = {
-                k: str(v)
+                k: v
                 for k, v in balances.items()
                 if k != "ARS" and v > self.DUST_TOLERANCE.get(k, D(0))
             }
-            if other:
-                raise RuntimeError(
-                    f"Start with only ARS cash, no existing positions; saw {other}"
-                )
             cash = balances.get("ARS", D(0))
-            if not 0 < cash <= D(self.s.capital):
-                raise RuntimeError(
-                    f"Fund the account with 0 < ARS <= configured cap; saw balances {dict((k, str(v)) for k, v in balances.items())}"
-                )
-            with self.l.transaction():
-                for k in ["cash", "initial_cash", "anchor"]:
-                    self.l.put(k, str(cash))
-                self.l.put("live_initialized", True)
+            if adopt_market is not None:
+                self._adopt(cash, other, adopt_market)
+            else:
+                if other:
+                    raise RuntimeError(
+                        f"Start with only ARS cash, no existing positions; saw "
+                        f"{ {k: str(v) for k, v in other.items()} }"
+                    )
+                if not 0 < cash <= D(self.s.capital):
+                    raise RuntimeError(
+                        f"Fund the account with 0 < ARS <= configured cap; saw balances {dict((k, str(v)) for k, v in balances.items())}"
+                    )
+                with self.l.transaction():
+                    for k in ["cash", "initial_cash", "anchor"]:
+                        self.l.put(k, str(cash))
+                    self.l.put("live_initialized", True)
         self.verify_balances()
         return {"mode": "live", "account_scoped": True}
+
+    def _adopt(self, cash, positions, market):
+        # Pre-existing holdings are manual, not the fly's trades: valuing them
+        # into initial_cash and anchor keeps them out of reinforcement and the
+        # loss stop's baseline. The funding cap covers their value too.
+        foreign = sorted(set(positions) - set(self.s.products))
+        if foreign:
+            raise RuntimeError(f"Holdings outside --products: {foreign}")
+        quotes = market.snapshot(set(positions))
+        now = time.time()
+        if any(
+            not -0.5 <= now - q.timestamp <= self.s.max_quote_age
+            for q in quotes.values()
+        ):
+            raise RuntimeError("Stale quote; adopt balances during market hours")
+        equity = cash + sum((v * quotes[k].bid for k, v in positions.items()), D(0))
+        if not 0 < equity <= D(self.s.capital):
+            raise RuntimeError(f"Adopted equity {equity} outside 0 < ARS <= configured cap")
+        with self.l.transaction():
+            self.l.put("cash", str(cash))
+            self.l.put("positions", {k: str(v) for k, v in positions.items()})
+            self.l.put("initial_cash", str(equity))
+            self.l.put("anchor", str(equity))
+            self.l.put("live_initialized", True)
 
     def verify_balances(self):
         actual = self.balances()

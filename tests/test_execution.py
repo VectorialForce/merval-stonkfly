@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from stonkfly.actions import StonkflyActions
 from stonkfly.broker import PaperBroker, PPIBroker, UnresolvedOrder
+from stonkfly.cli import _account_check
 from stonkfly.config import D, Settings
 from stonkfly.ledger import Ledger
 from stonkfly.market import Quote
@@ -382,3 +383,121 @@ def test_account_boundaries(env, change):
     with pytest.raises(RuntimeError):
         broker.preflight()
     assert client.submissions == 0
+
+
+class FakeMarket:
+    def __init__(self, **changes):
+        self.changes = changes
+
+    def snapshot(self, tickers):
+        return {t: quote(**self.changes) for t in tickers}
+
+
+def test_adopt_balances_starts_from_real_holdings_without_cash(env):
+    s, l, _ = env
+    client = FakePPIClient()
+    client.cash = D(0)
+    client.ggal = D(2)
+    broker = PPIBroker(s, l, client, "test-account")
+    broker.preflight(FakeMarket())
+    equity = 2 * quote().bid
+    assert l.cash == 0 and l.positions == {"GGAL": D(2)}
+    assert D(l.get("initial_cash")) == D(l.get("anchor")) == equity
+    broker.verify_balances()
+    with pytest.raises(RuntimeError):
+        broker.preflight(FakeMarket())
+
+
+@pytest.mark.parametrize(
+    "case", ["outside_products", "over_cap", "stale_quote", "used_ledger"]
+)
+def test_adopt_balances_boundaries(env, case):
+    s, l, _ = env
+    client = FakePPIClient()
+    client.cash = D(0)
+    client.ggal = D(2)
+    settings = Settings(products=("PAMP",)) if case == "outside_products" else s
+    broker = PPIBroker(settings, l, client, "test-account")
+    market = FakeMarket()
+    if case == "over_cap":
+        client.ggal = D(1000000)
+    if case == "stale_quote":
+        market = FakeMarket(timestamp=time.time() - 3600)
+    if case == "used_ledger":
+        l.put("tick", 1)
+    with pytest.raises(RuntimeError):
+        broker.preflight(market)
+    assert not l.get("live_initialized") and l.positions == {}
+
+
+def split_settlement_balances(immediate, next_day):
+    return {
+        "groupedAvailability": [
+            {
+                "availability": [
+                    {"symbol": "ARS", "amount": immediate, "settlement": "INMEDIATA"},
+                    {"symbol": "ARS", "amount": next_day, "settlement": "A-24HS"},
+                ]
+            }
+        ],
+        "groupedInstruments": [],
+    }
+
+
+def test_pending_settlement_debit_nets_against_immediate_cash(env):
+    s, l, _ = env
+    client = FakePPIClient()
+    client.balances_and_positions = lambda _: split_settlement_balances(56422.35, -45828.7)
+    assert PPIBroker(s, l, client, "test-account").balances()["ARS"] == D("10593.65")
+
+
+def test_net_negative_balance_still_stops(env):
+    s, l, _ = env
+    client = FakePPIClient()
+    client.balances_and_positions = lambda _: split_settlement_balances(100, -100.01)
+    with pytest.raises(RuntimeError, match="Negative external balance"):
+        PPIBroker(s, l, client, "test-account").balances()
+
+
+class FlakyBroker:
+    def __init__(self, failure=None):
+        self.failure = failure
+
+    def reconcile(self):
+        pass
+
+    def verify_balances(self):
+        if self.failure:
+            raise self.failure
+
+
+class Transient(RuntimeError):
+    pass
+
+
+def test_failed_account_read_skips_only_without_pending_orders(env):
+    s, l, g = env
+    assert _account_check(FlakyBroker(), l, Transient) is None
+    broker = FlakyBroker(Transient("empty response"))
+    assert _account_check(broker, l, Transient) == "empty response"
+    l.reserve(g.plan("GGAL", "BUY", {"GGAL": quote()}), time.time())
+    with pytest.raises(Transient):
+        _account_check(broker, l, Transient)
+
+
+def test_balance_mismatch_is_never_a_skip(env):
+    _, l, _ = env
+    with pytest.raises(RuntimeError, match="External balance change"):
+        _account_check(
+            FlakyBroker(RuntimeError("External balance change")), l, Transient
+        )
+
+
+@pytest.mark.parametrize(
+    "changes, reason",
+    [(dict(timestamp=0), "Stale or future quote: GGAL"), (dict(ask=D(1000)), "Spread limit: GGAL")],
+)
+def test_snapshot_veto_names_the_ticker(env, changes, reason):
+    _, _, g = env
+    with pytest.raises(Veto, match=reason):
+        g.check({"GGAL": quote(**changes)}, time.time(), {"GGAL"})

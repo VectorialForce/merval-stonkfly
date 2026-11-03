@@ -28,9 +28,9 @@ class Guard:
             if q.product != product:
                 raise Veto("Quote identity mismatch")
             if not -0.5 <= now - q.timestamp <= self.s.max_quote_age:
-                raise Veto("Stale or future quote")
+                raise Veto(f"Stale or future quote: {product}")
             if (q.ask - q.bid) / q.bid > D(self.s.spread_limit):
-                raise Veto("Spread limit")
+                raise Veto(f"Spread limit: {product}")
         if self.l.equity(quotes) <= D(self.l.get("initial_cash")) - D(self.s.loss_stop):
             self.l.halt("Loss stop reached; holdings remain exposed")
             raise Veto("Loss stop reached")
